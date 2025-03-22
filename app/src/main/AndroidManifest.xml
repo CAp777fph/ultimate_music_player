@@ -54,6 +54,18 @@
             android:theme="@style/Theme.UltimateMusicPlayer"
             android:parentActivityName=".MainActivity" />
 
+        <activity
+            android:name=".PlaylistDetailActivity"
+            android:exported="false"
+            android:theme="@style/Theme.UltimateMusicPlayer"
+            android:parentActivityName=".PlaylistActivity" />
+
+        <activity
+            android:name=".AddSongsToPlaylistActivity"
+            android:exported="false"
+            android:theme="@style/Theme.UltimateMusicPlayer"
+            android:parentActivityName=".PlaylistDetailActivity" />
+
         <service
             android:name=".MusicService"
             android:enabled="true"

@@ -1,33 +1,47 @@
 package com.cap.ultimatemusicplayer
 
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.ServiceConnection
+import android.graphics.drawable.Drawable
 import android.media.MediaPlayer
+import android.media.audiofx.Equalizer
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.IBinder
 import android.os.Looper
+import android.util.Log
+import android.view.LayoutInflater
+import android.view.MenuItem
+import android.view.View
+import android.widget.Button
+import android.widget.CompoundButton
 import android.widget.ImageButton
 import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.SeekBar
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import com.bumptech.glide.Glide
-import com.google.android.material.floatingactionbutton.FloatingActionButton
-import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import com.google.android.material.bottomsheet.BottomSheetDialog
-import androidx.recyclerview.widget.RecyclerView
 import androidx.recyclerview.widget.LinearLayoutManager
-import android.os.Build
-import androidx.appcompat.app.AlertDialog
-import android.widget.Button
-import android.view.View
-import android.widget.LinearLayout
-import android.util.Log
-import android.widget.Switch
+import androidx.recyclerview.widget.RecyclerView
+import com.bumptech.glide.Glide
+import com.bumptech.glide.load.DataSource
+import com.bumptech.glide.load.engine.DiskCacheStrategy
+import com.bumptech.glide.load.engine.GlideException
+import com.bumptech.glide.request.RequestListener
+import com.bumptech.glide.request.target.Target
+import com.google.android.material.bottomsheet.BottomSheetDialog
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.floatingactionbutton.FloatingActionButton
+import com.google.android.material.slider.Slider
 import java.io.Serializable
 
 class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener {
@@ -50,10 +64,20 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
     private lateinit var nextButtonDetails: ImageButton
     private lateinit var repeatButtonDetails: ImageButton
     
-    private var isPlaying = false
-    private var isFavorite = false
-    private var isShuffleEnabled = false
-    private var repeatMode = 0 // 0: none, 1: all, 2: one
+    // Song information variables
+    private var currentSongId: Long = -1L
+    private var songTitle: String = "Unknown Title"
+    private var songArtist: String = "Unknown Artist"
+    private var songAlbum: String = "Unknown Album"
+    private var albumArtUri: String? = null
+    private var isPlaying: Boolean = false
+    private var isFavorite: Boolean = false
+    private var isShuffleEnabled: Boolean = false
+    private var isMuted: Boolean = false
+    private var repeatMode: Int = 0
+    private var currentSpeed: Float = 1.0f
+    private val SPEED_EPSILON = 0.01f
+    
     private var timerHandler: Handler? = null
     private var timerRunnable: Runnable? = null
     private var remainingTime: Long = 0
@@ -70,15 +94,9 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
             updateSeekBarHandler.postDelayed(this, 1000)
         }
     }
-    private var isMuted = false
-    private var currentSongId: Long = -1
     private lateinit var favoritesManager: FavoritesManager
     private lateinit var equalizerManager: EqualizerManager
     private var equalizerDialog: AlertDialog? = null
-    private var currentSpeed: Float = 1.0f
-    private val SPEED_EPSILON = 0.001f  // For float comparisons
-    private var equalizerSetupAttempts = 0
-    private val MAX_EQUALIZER_SETUP_ATTEMPTS = 3
     private val equalizerSetupHandler = Handler(Looper.getMainLooper())
     private val equalizerSetupRunnable = object : Runnable {
         override fun run() {
@@ -89,52 +107,74 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
             }
         }
     }
+    private var equalizerSetupAttempts = 0
+    private val MAX_EQUALIZER_SETUP_ATTEMPTS = 3
+    
+    // Variables to track playlist context
+    private var isFromPlaylist = false
+    private var playlistId = -1L
+    private var playlistName = ""
 
     private val playbackStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                "com.cap.ultimatemusicplayer.PLAYBACK_STATE_UPDATE" -> {
-                    // Update playback state
-                    isPlaying = intent.getBooleanExtra("is_playing", false)
-                    val newShuffleState = intent.getBooleanExtra("is_shuffle_enabled", isShuffleEnabled)
-                    repeatMode = intent.getIntExtra("repeat_mode", 0)
-                    val newSpeed = intent.getFloatExtra("playback_speed", currentSpeed)
-                    val newMutedState = intent.getBooleanExtra("is_muted", isMuted)
+            if (intent?.action == "com.cap.ultimatemusicplayer.PLAYBACK_STATE_UPDATE") {
+                // Extract playback state from intent
+                isPlaying = intent.getBooleanExtra("is_playing", false)
+                isShuffleEnabled = intent.getBooleanExtra("is_shuffle_enabled", false)
+                repeatMode = intent.getIntExtra("repeat_mode", 0)
+                currentSpeed = intent.getFloatExtra("playback_speed", 1.0f)
+                
+                Log.d("SongDetailsActivity", "Playback state updated: isPlaying=$isPlaying, shuffle=$isShuffleEnabled, repeat=$repeatMode, speed=$currentSpeed")
+                
+                // Update UI to reflect current state
+                updatePlaybackControls()
+                updateSpeedButtonColor()
+                
+                // Update seekbar if included in this update
+                if (intent.hasExtra("current_position") && intent.hasExtra("total_duration")) {
+                    val currentPosition = intent.getIntExtra("current_position", 0)
+                    val totalDuration = intent.getIntExtra("total_duration", 0)
                     
-                    // Handle shuffle state updates
-                    if (isShuffleEnabled != newShuffleState) {
-                        Log.d("ShuffleControl", "Shuffle state changed from $isShuffleEnabled to $newShuffleState")
-                        isShuffleEnabled = newShuffleState
+                    // Update seekbar and time displays
+                    if (!isTrackingTouch) {
+                        seekBarDetails.max = totalDuration
+                        seekBarDetails.progress = currentPosition
                     }
                     
-                    // Handle speed updates
-                    if (kotlin.math.abs(currentSpeed - newSpeed) > SPEED_EPSILON) {
-                        Log.d("SpeedControl", "Received new speed from service: $newSpeed")
-                        currentSpeed = newSpeed
-                    }
-                    
-                    // Handle mute state updates
-                    if (isMuted != newMutedState) {
-                        Log.d("VolumeControl", "Mute state changed from $isMuted to $newMutedState")
-                        isMuted = newMutedState
-                    }
-                    
-                    // Update UI
-                    runOnUiThread {
-                        updatePlaybackControls()
-                        updateVolumeButtonState()
-                        updateSpeedButtonColor()
-                    }
+                    currentTimeDetails.text = formatTime(currentPosition)
+                    totalTimeDetails.text = formatTime(totalDuration)
                 }
-                "com.cap.ultimatemusicplayer.SEEKBAR_UPDATE" -> {
+            } else if (intent?.action == "com.cap.ultimatemusicplayer.SEEKBAR_UPDATE") {
+                // This is just a seekbar position update, don't update playback controls
+                try {
+                    // Try to get values as Integer first (which is what the service is sending based on the error)
                     val currentPosition = intent.getIntExtra("current_position", 0)
                     val duration = intent.getIntExtra("duration", 0)
                     
-                    // Update seekbar and time displays
-                    seekBarDetails.max = duration
-                    seekBarDetails.progress = currentPosition
-                    currentTimeDetails.text = formatTime(currentPosition)
-                    totalTimeDetails.text = formatTime(duration)
+                    // Log received values for debugging
+                    Log.d("SongDetailsActivity", "Received seekbar update: position=$currentPosition, duration=$duration")
+                    
+                    // Ensure UI updates happen on the main thread
+                    runOnUiThread {
+                        if (!isTrackingTouch) {
+                            if (duration > 0) {
+                                seekBarDetails.max = duration
+                                seekBarDetails.progress = currentPosition
+                            } else {
+                                Log.e("SongDetailsActivity", "Invalid duration: $duration")
+                            }
+                            
+                            currentTimeDetails.text = formatTime(currentPosition)
+                            totalTimeDetails.text = formatTime(duration)
+                            
+                            // Log the actual values being set
+                            Log.d("SongDetailsActivity", "Updated seekbar: progress=${seekBarDetails.progress}, max=${seekBarDetails.max}")
+                        } else {
+                            Log.d("SongDetailsActivity", "Skipping seekbar update due to user interaction")
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e("SongDetailsActivity", "Error handling seekbar update: ${e.message}")
                 }
             }
         }
@@ -157,32 +197,25 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
     private val songChangeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == "com.cap.ultimatemusicplayer.SONG_CHANGED") {
+                val songId = intent.getLongExtra("song_id", -1L)
                 val songTitle = intent.getStringExtra("song_title")
                 val songArtist = intent.getStringExtra("song_artist")
-                val albumArtUri = intent.getStringExtra("album_art_uri")
-                val songId = intent.getLongExtra("song_id", -1L)
+                val songAlbumArtUri = intent.getStringExtra("song_album_art_uri") 
+                    ?: intent.getStringExtra("album_art_uri") // Try both variations
                 
-                // Update UI with new song details
-                songInfo.text = songTitle
-                artistNameDetails.text = songArtist
-                currentSongId = songId
+                Log.d("SongDetailsActivity", "Received song change: ID=$songId, Title=$songTitle, Artist=$songArtist, AlbumArt=$songAlbumArtUri")
                 
-                // Check favorite status and update UI immediately
-                if (currentSongId != -1L) {
-                    isFavorite = favoritesManager.isFavorite(currentSongId)
-                    updateFavoriteButtonState()
+                // Update song details in the UI
+                runOnUiThread {
+                    if (songTitle != null && songArtist != null) {
+                        updateSongInfo(songTitle, songArtist, songAlbumArtUri)
+                    }
                 }
                 
-                // Update album art
-                if (albumArtUri != null) {
-                    Glide.with(this@SongDetailsActivity)
-                        .load(albumArtUri)
-                        .placeholder(R.drawable.ic_music_note)
-                        .error(R.drawable.ic_music_note)
-                        .centerCrop()
-                        .into(albumArtLarge)
-                } else {
-                    albumArtLarge.setImageResource(R.drawable.ic_music_note)
+                // Update playback state if included
+                if (intent.hasExtra("is_playing")) {
+                    isPlaying = intent.getBooleanExtra("is_playing", false)
+                    updatePlaybackControls()
                 }
             }
         }
@@ -303,33 +336,50 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
                 "Failed to set up equalizer: $error",
                 Toast.LENGTH_SHORT
             ).show()
-            equalizerButton.setColorFilter(ContextCompat.getColor(this, R.color.white))
+            equalizerButton.setColorFilter(ContextCompat.getColor(this@SongDetailsActivity, R.color.white))
+        }
+    }
+
+    private lateinit var musicService: MusicService
+    private var isBound = false
+
+    private val musicServiceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            musicService = (service as MusicService.MusicBinder).getService()
+            isBound = true
+            onBindingComplete()
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            isBound = false
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_song_details)
-
-        // Initialize managers
-        favoritesManager = FavoritesManager(this)
+        
+        // Initialize views
+        initializeViews()
+        
+        // Setup equalizer manager
         equalizerManager = EqualizerManager(this)
         
-        // Debug log to confirm initialization
-        Log.d("Equalizer", "EqualizerManager initialized in onCreate")
-
-        // Register receivers
-        registerReceivers()
-
-        initializeViews()
-        setupClickListeners()
+        // Setup favorites manager
+        favoritesManager = FavoritesManager(this)
+        
+        // Load song details right away from intent
         loadSongDetails()
         
-        // Start seekbar updates
-        updateSeekBarHandler.post(updateSeekBarRunnable)
+        // Register broadcast receivers
+        registerReceivers()
         
-        // Start equalizer setup attempts
-        equalizerSetupHandler.post(equalizerSetupRunnable)
+        // Bind to MusicService
+        val serviceIntent = Intent(this, MusicService::class.java)
+        bindService(serviceIntent, musicServiceConnection, Context.BIND_AUTO_CREATE)
+        
+        // Set up click listeners
+        setupClickListeners()
     }
 
     override fun onDestroy() {
@@ -345,6 +395,7 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
         equalizerManager.release()
         equalizerDialog?.dismiss()
         equalizerDialog = null
+        unbindService(musicServiceConnection)
     }
 
     private fun initializeViews() {
@@ -384,11 +435,19 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
         }
 
         previousButtonDetails.setOnClickListener {
-            sendControlCommand("PLAY_PREVIOUS")
+            if (isBound) {
+                musicService.playPreviousInPlaylist()
+            } else {
+                sendControlCommand("PLAY_PREVIOUS")
+            }
         }
 
         nextButtonDetails.setOnClickListener {
-            sendControlCommand("PLAY_NEXT")
+            if (isBound) {
+                musicService.playNextInPlaylist()
+            } else {
+                sendControlCommand("PLAY_NEXT")
+            }
         }
 
         shuffleButtonDetails.setOnClickListener {
@@ -434,7 +493,7 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
         equalizerButton.setOnClickListener {
             showEqualizerDialog()
             // Set the button color to accent when dialog is shown
-            equalizerButton.setColorFilter(ContextCompat.getColor(this, R.color.accent_color))
+            equalizerButton.setColorFilter(ContextCompat.getColor(this@SongDetailsActivity, R.color.accent_color))
         }
         
         timerButton.setOnClickListener {
@@ -490,7 +549,7 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
                     sendBroadcast(intent)
                     
                     // Show toast with selected speed
-                Toast.makeText(this, "Playback speed: ${speeds[which]}", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@SongDetailsActivity, "Playback speed: ${speeds[which]}", Toast.LENGTH_SHORT).show()
                 }
                 
                 dialog.dismiss()
@@ -502,9 +561,9 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
         try {
             val isNormalSpeed = kotlin.math.abs(currentSpeed - 1.0f) < SPEED_EPSILON
             val color = if (!isNormalSpeed) {
-                ContextCompat.getColor(this, R.color.accent_color)
+                ContextCompat.getColor(this@SongDetailsActivity, R.color.accent_color)
             } else {
-                ContextCompat.getColor(this, R.color.white)
+                ContextCompat.getColor(this@SongDetailsActivity, R.color.white)
             }
             
             Log.d("SpeedControl", "Updating speed button: Speed=$currentSpeed, isNormal=$isNormalSpeed, color=${if (!isNormalSpeed) "accent" else "white"}")
@@ -530,67 +589,32 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
         sendBroadcast(intent)
         } catch (e: Exception) {
             Log.e("SongDetailsActivity", "Error sending control command: ${e.message}")
-            Toast.makeText(this, "Error controlling playback", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this@SongDetailsActivity, "Error controlling playback", Toast.LENGTH_SHORT).show()
         }
     }
 
     private fun loadSongDetails() {
-        // Get song details from intent
-        currentSongId = intent.getLongExtra("song_id", -1)
-        val songTitle = intent.getStringExtra("song_title")
-        val songArtist = intent.getStringExtra("song_artist")
-        val albumArtUri = intent.getStringExtra("album_art_uri")
+        // Get song details from the intent
+        currentSongId = intent.getLongExtra("song_id", -1L)
+        songTitle = intent.getStringExtra("song_title") ?: "Unknown Title"
+        songArtist = intent.getStringExtra("song_artist") ?: "Unknown Artist"
+        songAlbum = intent.getStringExtra("song_album") ?: "Unknown Album"
+        albumArtUri = intent.getStringExtra("song_album_art_uri") // Fix the key to match PlaylistDetailActivity
         
-        // Get current playback state from intent
+        Log.d("SongDetailsActivity", "Loading song details: ID=$currentSongId, Title=$songTitle, Artist=$songArtist, AlbumArt=$albumArtUri")
+        
+        // Update the UI with song details
+        updateSongInfo(songTitle, songArtist, albumArtUri)
+        
+        // Check if we should start playing immediately
         isPlaying = intent.getBooleanExtra("is_playing", false)
-        isShuffleEnabled = intent.getBooleanExtra("is_shuffle_enabled", false)
-        repeatMode = intent.getIntExtra("repeat_mode", 0)
-        currentSpeed = intent.getFloatExtra("playback_speed", 1.0f)
-        
-        // Request audio session ID for equalizer setup
-        val serviceIntent = Intent(this, MusicService::class.java).apply {
-            action = "GET_AUDIO_SESSION_ID"
-        }
-        startService(serviceIntent)
-        
-        // Check favorite status from FavoritesManager
-        if (currentSongId != -1L) {
-            isFavorite = favoritesManager.isFavorite(currentSongId)
-            updateFavoriteButtonState()
-        }
-        
-        // Update UI based on current state
-        songInfo.text = songTitle
-        artistNameDetails.text = songArtist
-        
-        // Update playback controls
         updatePlaybackControls()
-
-        // Load album art
-        if (albumArtUri != null) {
-            Glide.with(this)
-                .load(albumArtUri)
-                .placeholder(R.drawable.ic_music_note)
-                .error(R.drawable.ic_music_note)
-                .centerCrop()
-                .into(albumArtLarge)
-        } else {
-            albumArtLarge.setImageResource(R.drawable.ic_music_note)
-        }
-
-        // Initialize timer button color to white
-        timerButton.setColorFilter(ContextCompat.getColor(this, R.color.white))
-
-        // Initialize playback speed button color
-        updateSpeedButtonColor()
         
-        // Debug log
-        Log.d("SpeedControl", "Initial speed: $currentSpeed")
-
-        // Update UI immediately after loading state
-        updatePlaybackControls()
-        updateVolumeButtonState()
-        updateSpeedButtonColor()
+        // Request current playback state from service
+        requestPlaybackState()
+        
+        // Update favorite button state
+        updateFavoriteButtonState()
     }
 
     private fun showTimerDialog() {
@@ -603,10 +627,10 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
                 val selectedTime = times[which]
                 if (selectedTime == 0L) {
                     cancelTimer()
-                    Toast.makeText(this, "Timer cancelled", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@SongDetailsActivity, "Timer cancelled", Toast.LENGTH_SHORT).show()
                 } else {
                     setTimer(selectedTime)
-                    Toast.makeText(this, "Timer set for $selectedTime minutes", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@SongDetailsActivity, "Timer set for $selectedTime minutes", Toast.LENGTH_SHORT).show()
                 }
             }
             .show()
@@ -620,7 +644,7 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
         remainingTime = minutes * 60 * 1000
 
         // Set volume and timer buttons color to green when timer is active
-        timerButton.setColorFilter(ContextCompat.getColor(this, R.color.accent_color))
+        timerButton.setColorFilter(ContextCompat.getColor(this@SongDetailsActivity, R.color.accent_color))
 
         timerHandler = Handler(Looper.getMainLooper())
         timerRunnable = object : Runnable {
@@ -635,7 +659,7 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
                 }
             }
         }
-        timerHandler?.postDelayed(timerRunnable!!, 1000)
+        timerHandler?.postDelayed(timerRunnable!!, 100)
     }
 
     private fun cancelTimer() {
@@ -644,8 +668,8 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
         timerRunnable = null
         remainingTime = 0
         // Reset both volume and timer buttons color to white when timer is cancelled
-        volumeButton.setColorFilter(ContextCompat.getColor(this, R.color.white))
-        timerButton.setColorFilter(ContextCompat.getColor(this, R.color.white))
+        volumeButton.setColorFilter(ContextCompat.getColor(this@SongDetailsActivity, R.color.white))
+        timerButton.setColorFilter(ContextCompat.getColor(this@SongDetailsActivity, R.color.white))
     }
 
     private fun showSongListBottomSheet() {
@@ -725,11 +749,11 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
             // Request song list after showing dialog
             Handler(Looper.getMainLooper()).postDelayed({
                 sendControlCommand("GET_SONG_LIST")
-                Toast.makeText(this, "Loading song list...", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@SongDetailsActivity, "Loading song list...", Toast.LENGTH_SHORT).show()
             }, 100)
             
         } catch (e: Exception) {
-            Toast.makeText(this, "Failed to load song list", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this@SongDetailsActivity, "Failed to load song list", Toast.LENGTH_SHORT).show()
             bottomSheetDialog.dismiss()
         }
     }
@@ -737,7 +761,7 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
     private fun updateFavoriteButtonState() {
         val color = if (isFavorite) R.color.accent_color else R.color.white
         favoriteButton.setImageResource(if (isFavorite) R.drawable.ic_favorite else R.drawable.ic_favorite_border)
-        favoriteButton.setColorFilter(ContextCompat.getColor(this, color))
+        favoriteButton.setColorFilter(ContextCompat.getColor(this@SongDetailsActivity, color))
     }
 
     // SeekBar.OnSeekBarChangeListener implementations
@@ -775,25 +799,38 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
     }
 
     private fun updateSongInfo(title: String?, artist: String?, albumArtUri: String?) {
-        songInfo.text = title
-        artistNameDetails.text = artist
+        // Update text views
+        songInfo.text = title ?: "Unknown Title"
+        artistNameDetails.text = artist ?: "Unknown Artist"
+        
+        // Log album art loading to debug
+        Log.d("SongDetailsActivity", "Loading album art from URI: $albumArtUri")
         
         // Load album art
-        if (albumArtUri != null) {
-            Glide.with(this)
-                .load(albumArtUri)
-                .placeholder(R.drawable.ic_music_note)
-                .error(R.drawable.ic_music_note)
-                .centerCrop()
-                .into(albumArtLarge)
-        } else {
+        try {
+            if (albumArtUri != null && albumArtUri.isNotEmpty()) {
+                Glide.with(this)
+                    .load(albumArtUri)
+                    .placeholder(R.drawable.ic_music_note)
+                    .error(R.drawable.ic_music_note)
+                    .diskCacheStrategy(DiskCacheStrategy.ALL)  // Cache the image
+                    .centerCrop()
+                    .into(albumArtLarge)
+                
+                Log.d("SongDetailsActivity", "Started loading album art from URI: $albumArtUri")
+            } else {
+                Log.d("SongDetailsActivity", "No album art URI provided, using default image")
+                albumArtLarge.setImageResource(R.drawable.ic_music_note)
+            }
+        } catch (e: Exception) {
+            Log.e("SongDetailsActivity", "Error loading album art: ${e.message}")
             albumArtLarge.setImageResource(R.drawable.ic_music_note)
         }
     }
-
+    
     private var equalizerDialogRequested = false
     private var equalizerTempMediaPlayer: MediaPlayer? = null
-
+    
     private fun showEqualizerDialog() {
         // Add debug logs to track the flow
         Log.d("Equalizer", "showEqualizerDialog called, checking availability")
@@ -861,7 +898,7 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
             }
             
             // If we got here, the direct approach failed
-            Toast.makeText(this, "Setting up equalizer, please wait...", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this@SongDetailsActivity, "Setting up equalizer, please wait...", Toast.LENGTH_SHORT).show()
             
             // Set flag to indicate dialog was requested
             equalizerDialogRequested = true
@@ -912,7 +949,7 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
                                 showEqualizerDialog()
                             } else {
                                 Log.d("Equalizer", "Final retry - Equalizer setup failed after multiple attempts")
-                                Toast.makeText(this, "Failed to set up equalizer after multiple attempts", Toast.LENGTH_LONG).show()
+                                Toast.makeText(this@SongDetailsActivity, "Failed to set up equalizer after multiple attempts", Toast.LENGTH_LONG).show()
                                 equalizerDialogRequested = false
                             }
                         }, 3000)
@@ -1023,7 +1060,7 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
                     equalizerManager.setEnabled(isChecked)
                     
                     // Also apply to the active music playback
-                    val serviceIntent = Intent(this, MusicService::class.java).apply {
+                    val serviceIntent = Intent(this@SongDetailsActivity, MusicService::class.java).apply {
                         action = "APPLY_EQUALIZER_SETTINGS"
                         putExtra("bandLevels", equalizerManager.getBandLevels() as java.io.Serializable)
                         putExtra("enabled", isChecked)
@@ -1052,14 +1089,14 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
                     }
                     
                     // Also apply to the active music playback
-                    val serviceIntent = Intent(this, MusicService::class.java).apply {
+                    val serviceIntent = Intent(this@SongDetailsActivity, MusicService::class.java).apply {
                         action = "APPLY_EQUALIZER_SETTINGS"
                         putExtra("bandLevels", equalizerManager.getBandLevels() as java.io.Serializable)
                         putExtra("enabled", enableSwitch.isChecked)
                     }
                     startService(serviceIntent)
                     
-                    Toast.makeText(this, "Equalizer reset", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@SongDetailsActivity, "Equalizer reset", Toast.LENGTH_SHORT).show()
                 } catch (e: Exception) {
                     Log.e("Equalizer", "Error resetting equalizer: ${e.message}")
                 }
@@ -1078,7 +1115,7 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
                 equalizerTempMediaPlayer = null
                 
                 // Apply final settings to the active music playback
-                val serviceIntent = Intent(this, MusicService::class.java).apply {
+                val serviceIntent = Intent(this@SongDetailsActivity, MusicService::class.java).apply {
                     action = "APPLY_EQUALIZER_SETTINGS"
                     putExtra("bandLevels", equalizerManager.getBandLevels() as java.io.Serializable)
                     putExtra("enabled", enableSwitch.isChecked)
@@ -1090,13 +1127,25 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
         } catch (e: Exception) {
             Log.e("Equalizer", "Error creating equalizer dialog: ${e.message}")
             e.printStackTrace()
-            Toast.makeText(this, "Error creating equalizer: ${e.message}", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this@SongDetailsActivity, "Error creating equalizer: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
 
     private fun updatePlaybackControls() {
         // Update play/pause button
         playPauseButtonDetails.setImageResource(if (isPlaying) R.drawable.ic_pause else R.drawable.ic_play)
+        
+        // Start or stop the seekbar updates based on playback state
+        if (isPlaying) {
+            // Start seekbar updates if not already running
+            updateSeekBarHandler.removeCallbacks(updateSeekBarRunnable) // Remove any existing callbacks first
+            updateSeekBarHandler.post(updateSeekBarRunnable) // Start updating the seekbar
+            Log.d("SongDetailsActivity", "Started seekbar updates")
+        } else {
+            // Stop seekbar updates if playback is paused
+            updateSeekBarHandler.removeCallbacks(updateSeekBarRunnable)
+            Log.d("SongDetailsActivity", "Stopped seekbar updates")
+        }
         
         // Update shuffle button
         updateShuffleButtonState()
@@ -1110,17 +1159,17 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
         }
         repeatButtonDetails.setImageResource(repeatIcon)
         repeatButtonDetails.setColorFilter(
-            if (repeatMode != 0) ContextCompat.getColor(this, R.color.accent_color)
-            else ContextCompat.getColor(this, R.color.white)
+            if (repeatMode != 0) ContextCompat.getColor(this@SongDetailsActivity, R.color.accent_color)
+            else ContextCompat.getColor(this@SongDetailsActivity, R.color.white)
         )
     }
 
     private fun updateShuffleButtonState() {
         shuffleButtonDetails.setImageResource(if (isShuffleEnabled) R.drawable.ic_shuffle_on else R.drawable.ic_shuffle)
         val color = if (isShuffleEnabled) {
-            ContextCompat.getColor(this, R.color.accent_color)
+            ContextCompat.getColor(this@SongDetailsActivity, R.color.accent_color)
             } else {
-            ContextCompat.getColor(this, R.color.white)
+            ContextCompat.getColor(this@SongDetailsActivity, R.color.white)
         }
         shuffleButtonDetails.clearColorFilter()
         shuffleButtonDetails.setColorFilter(color)
@@ -1131,9 +1180,9 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
     private fun updateVolumeButtonState() {
         volumeButton.setImageResource(if (isMuted) R.drawable.ic_volume_off else R.drawable.ic_volume_up)
         val color = if (isMuted) {
-            ContextCompat.getColor(this, R.color.accent_color)
+            ContextCompat.getColor(this@SongDetailsActivity, R.color.accent_color)
         } else {
-            ContextCompat.getColor(this, R.color.white)
+            ContextCompat.getColor(this@SongDetailsActivity, R.color.white)
         }
         volumeButton.clearColorFilter()
         volumeButton.setColorFilter(color)
@@ -1157,7 +1206,6 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
         // Register playback state receiver
         val playbackStateFilter = IntentFilter().apply {
             addAction("com.cap.ultimatemusicplayer.PLAYBACK_STATE_UPDATE")
-            addAction("com.cap.ultimatemusicplayer.SEEKBAR_UPDATE")
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(playbackStateReceiver, playbackStateFilter, Context.RECEIVER_NOT_EXPORTED)
@@ -1196,6 +1244,14 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
         } else {
             registerReceiver(audioSessionReceiver, audioSessionFilter)
         }
+        
+        // Register seekbar update receiver
+        val seekbarUpdateFilter = IntentFilter("com.cap.ultimatemusicplayer.SEEKBAR_UPDATE")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(playbackStateReceiver, seekbarUpdateFilter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(playbackStateReceiver, seekbarUpdateFilter)
+        }
     }
 
     private fun requestPlaybackState() {
@@ -1205,4 +1261,22 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
         }
         startService(serviceIntent)
     }
-} 
+
+    private fun onBindingComplete() {
+        if (isBound && isFromPlaylist) {
+            Log.d("SongDetailsActivity", "Service bound and song is from playlist. Ensuring playlist context is set.")
+            // Ensure the MusicService has the playlist context
+            val playlistManager = PlaylistManager(this)
+            val playlist = playlistManager.getPlaylistById(playlistId)
+            
+            if (playlist != null && currentSongId != -1L) {
+                val songIndex = playlist.songs.indexOfFirst { song -> song.id == currentSongId }
+                if (songIndex != -1) {
+                    val song = playlist.songs[songIndex]
+                    musicService.playSong(song, playlist.songs, songIndex)
+                    Log.d("SongDetailsActivity", "Set playlist context with ${playlist.songs.size} songs, current at index $songIndex")
+                }
+            }
+        }
+    }
+}

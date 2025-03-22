@@ -8,15 +8,25 @@ import com.google.gson.reflect.TypeToken
 class PlaylistManager(context: Context) {
     private val sharedPreferences: SharedPreferences = context.getSharedPreferences("playlists", Context.MODE_PRIVATE)
     private val gson = Gson()
+    private var cachedPlaylists: List<Playlist>? = null
 
-    fun getAllPlaylists(): List<Playlist> {
+    fun getAllPlaylists(forceRefresh: Boolean = false): List<Playlist> {
+        // If we have a cached version and don't need to force refresh, return it
+        if (!forceRefresh && cachedPlaylists != null) {
+            return cachedPlaylists!!
+        }
+        
         val playlistsJson = sharedPreferences.getString("playlists", null)
-        return if (playlistsJson != null) {
+        val result = if (playlistsJson != null) {
             val type = object : TypeToken<List<Playlist>>() {}.type
-            gson.fromJson(playlistsJson, type)
+            gson.fromJson<List<Playlist>>(playlistsJson, type)
         } else {
             emptyList()
         }
+        
+        // Update cache
+        cachedPlaylists = result
+        return result
     }
 
     fun addPlaylist(playlist: Playlist) {
@@ -71,8 +81,24 @@ class PlaylistManager(context: Context) {
         }
     }
 
+    /**
+     * Get a playlist by its ID
+     * @param playlistId The ID of the playlist to retrieve
+     * @return The playlist with the given ID, or null if not found
+     */
+    fun getPlaylistById(playlistId: Long): Playlist? {
+        return getAllPlaylists().find { it.id == playlistId }
+    }
+
     private fun savePlaylists(playlists: List<Playlist>) {
+        val editor = sharedPreferences.edit()
         val playlistsJson = gson.toJson(playlists)
-        sharedPreferences.edit().putString("playlists", playlistsJson).apply()
+        editor.putString("playlists", playlistsJson)
+        
+        // Apply changes immediately for faster updates
+        editor.commit() // Using commit instead of apply for immediate disk write
+        
+        // Update cache after saving
+        cachedPlaylists = playlists
     }
 } 

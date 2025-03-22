@@ -24,6 +24,7 @@ import android.view.View.OnLongClickListener
 import android.app.AlertDialog
 import android.text.InputType
 import android.content.Intent
+import android.util.Log
 
 class PlaylistActivity : AppCompatActivity() {
     private lateinit var playlistsRecyclerView: RecyclerView
@@ -76,10 +77,6 @@ class PlaylistActivity : AppCompatActivity() {
         super.onResume()
         // Refresh playlists when returning to this activity
         loadPlaylists()
-        
-        // Send a broadcast to update the playlist count in MainActivity
-        val intent = Intent("com.cap.ultimatemusicplayer.PLAYLIST_UPDATED")
-        sendBroadcast(intent)
     }
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
@@ -203,8 +200,7 @@ class PlaylistActivity : AppCompatActivity() {
             loadPlaylists()
             
             // Notify MainActivity to update playlist count
-            val intent = Intent("com.cap.ultimatemusicplayer.PLAYLIST_UPDATED")
-            sendBroadcast(intent)
+            sendPlaylistUpdateBroadcast()
             
             Toast.makeText(this, "Playlist created successfully", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
@@ -213,8 +209,12 @@ class PlaylistActivity : AppCompatActivity() {
     }
 
     private fun showPlaylistSongs(playlist: Playlist) {
-        // TODO: Implement showing songs in playlist
-        Toast.makeText(this, "Showing songs in playlist: ${playlist.name}", Toast.LENGTH_SHORT).show()
+        // Launch PlaylistDetailActivity to show songs in the playlist
+        val intent = Intent(this, PlaylistDetailActivity::class.java).apply {
+            putExtra("playlist_id", playlist.id)
+            putExtra("playlist_name", playlist.name)
+        }
+        startActivity(intent)
     }
 
     private fun loadPlaylists() {
@@ -287,9 +287,8 @@ class PlaylistActivity : AppCompatActivity() {
         updateEmptyView()
         exitSelectionMode()
         
-        // Notify MainActivity to update playlist count
-        val intent = Intent("com.cap.ultimatemusicplayer.PLAYLIST_UPDATED")
-        sendBroadcast(intent)
+        // Notify MainActivity to update playlist count - use immediate notification
+        sendPlaylistUpdateBroadcast()
         
         Toast.makeText(this, "${playlistsToDelete.size} playlist(s) deleted", Toast.LENGTH_SHORT).show()
     }
@@ -328,13 +327,33 @@ class PlaylistActivity : AppCompatActivity() {
                     exitSelectionMode()
                     
                     // Notify MainActivity to update playlist count
-                    val intent = Intent("com.cap.ultimatemusicplayer.PLAYLIST_UPDATED")
-                    sendBroadcast(intent)
+                    sendPlaylistUpdateBroadcast()
                     
                     Toast.makeText(this, "Playlists deleted successfully", Toast.LENGTH_SHORT).show()
                 }
                 .setNegativeButton("Cancel", null)
                 .show()
         }
+    }
+
+    /**
+     * Send a broadcast to notify MainActivity to update playlist counts immediately
+     */
+    private fun sendPlaylistUpdateBroadcast() {
+        // Get the current playlist count directly
+        val currentPlaylistCount = playlistManager.getAllPlaylists(true).size
+        
+        // Create broadcast with the count included
+        val intent = Intent("com.cap.ultimatemusicplayer.PLAYLIST_UPDATED").apply {
+            // Include the count directly in the broadcast
+            putExtra("playlist_count", currentPlaylistCount)
+            addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
+        }
+        
+        // Send an ordered broadcast with higher priority
+        sendOrderedBroadcast(intent, null)
+        
+        // Log for debugging
+        Log.d("PlaylistActivity", "Sent playlist update broadcast with count: $currentPlaylistCount")
     }
 }

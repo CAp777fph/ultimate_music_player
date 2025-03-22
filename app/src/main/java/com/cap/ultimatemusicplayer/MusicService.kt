@@ -17,15 +17,15 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.support.v4.media.MediaMetadataCompat
+import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
-import androidx.media.session.MediaButtonReceiver
-import android.support.v4.media.MediaMetadataCompat
-import android.support.v4.media.session.MediaSessionCompat
-import android.support.v4.media.session.PlaybackStateCompat
 import androidx.media.app.NotificationCompat.MediaStyle
+import androidx.media.session.MediaButtonReceiver
 import com.google.android.exoplayer2.ExoPlayer
 import com.google.android.exoplayer2.MediaItem
 import com.google.android.exoplayer2.PlaybackException
@@ -48,24 +48,41 @@ class MusicService : Service() {
     private var equalizer: Equalizer? = null
     private var equalizerEnabled = false
     private var exoPlayer: SimpleExoPlayer? = null
+    
+    // Playlist tracking
+    private var playlistSongs: List<Song>? = null
+    private var currentPlaylistPosition: Int = -1
+    private var isPlaylistActive: Boolean = false
 
     private val updateSeekBarRunnable = object : Runnable {
         override fun run() {
             if (_isPlaying) {
                 exoPlayer?.let { player ->
-                    val currentPosition = player.currentPosition
-                    val duration = player.duration
+                    val currentPosition = player.currentPosition.toInt()
+                    val duration = player.duration.toInt()
+                    
+                    Log.d("MusicService", "Seekbar update: position=$currentPosition, duration=$duration")
 
-                    // Update seekbar in UI
+                    // Always send both UI and notification updates
                     sendBroadcast(Intent("com.cap.ultimatemusicplayer.SEEKBAR_UPDATE").apply {
                         putExtra("current_position", currentPosition)
                         putExtra("duration", duration)
+                        // Add flags to ensure high priority delivery
+                        addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
                     })
 
-                    // Update MediaSession playback state for notification seekbar
-                    updateMediaSessionPlaybackState(currentPosition)
+                    // Also include position in playback state update for consistency
+                    updateMediaSessionPlaybackState(currentPosition.toLong())
+                    
+                    // If current song info is available, consider re-sending it to ensure UI is in sync
+                    currentSong?.let { song ->
+                        if (Math.random() < 0.05) { // Occasionally refresh song info (5% chance each update)
+                            broadcastSongChange(song)
+                        }
+                    }
                 }
-                handler.postDelayed(this, 500) // Update more frequently (twice per second)
+                // Update more frequently for smoother seekbar movement
+                handler.postDelayed(this, 500) // Update twice per second
             }
         }
     }
@@ -113,11 +130,11 @@ class MusicService : Service() {
                 }
 
                 override fun onSkipToNext() {
-                    playNext()
+                    playNextInPlaylist()
                 }
 
                 override fun onSkipToPrevious() {
-                    playPrevious()
+                    playPreviousInPlaylist()
                 }
 
                 override fun onSeekTo(pos: Long) {
@@ -145,8 +162,8 @@ class MusicService : Service() {
 
         when (intent?.action) {
             "ACTION_PLAY_PAUSE" -> togglePlayPause()
-            "ACTION_NEXT" -> playNext()
-            "ACTION_PREVIOUS" -> playPrevious()
+            "ACTION_NEXT" -> playNextInPlaylist()
+            "ACTION_PREVIOUS" -> playPreviousInPlaylist()
             "GET_AUDIO_SESSION_ID" -> {
                 // Always send the current audio session ID, even if ExoPlayer isn't fully ready
                 exoPlayer?.let { player ->
@@ -180,6 +197,19 @@ class MusicService : Service() {
                     })
                 }
             }
+            "GET_CURRENT_POSITION" -> {
+                // Send current seekbar position in response to direct request
+                exoPlayer?.let { player ->
+                    val currentPosition = player.currentPosition.toInt()
+                    val duration = player.duration.toInt()
+                    Log.d("MusicService", "Responding to GET_CURRENT_POSITION with pos=$currentPosition, duration=$duration")
+                    sendBroadcast(Intent("com.cap.ultimatemusicplayer.SEEKBAR_UPDATE").apply {
+                        putExtra("current_position", currentPosition)
+                        putExtra("duration", duration)
+                        addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
+                    })
+                }
+            }
             "APPLY_EQUALIZER_SETTINGS" -> {
                 val bandLevels = intent.getSerializableExtra("bandLevels") as? HashMap<Short, Short>
                 val enabled = intent.getBooleanExtra("enabled", false)
@@ -189,6 +219,12 @@ class MusicService : Service() {
                 if (bandLevels != null) {
                     applyEqualizerSettings(bandLevels, enabled)
                 }
+            }
+            "UPDATE_SONG_TITLE" -> {
+                val songId = intent.getLongExtra("song_id", -1)
+                val newTitle = intent.getStringExtra("new_title") ?: ""
+
+                updateSongIfActive(songId, newTitle)
             }
         }
         return START_STICKY
@@ -288,11 +324,17 @@ class MusicService : Service() {
                             _isPlaying = true
                             _isMediaPlayerReady = true
 
+                            // Start the seekbar update immediately
+                            handler.removeCallbacks(updateSeekBarRunnable)
+                            handler.post(updateSeekBarRunnable)
+                            
                             // Update UI
                             updateMediaSessionMetadata()
                             sendPlaybackStateUpdate()
-                            handler.post(updateSeekBarRunnable)
                             updateNotification()
+
+                            // Broadcast song change immediately after ready state
+                            broadcastSongChange(song)
 
                             Log.d("MusicService", "ExoPlayer playback started successfully")
                         }
@@ -322,10 +364,204 @@ class MusicService : Service() {
 
             // Update current song
             currentSong = song
+            
+            // Send initial change broadcast immediately
+            broadcastSongChange(song)
 
         } catch (e: Exception) {
             Log.e("MusicService", "Fatal error in playSong", e)
             cleanupMediaPlayer()
+        }
+    }
+    
+    /**
+     * Helper method to broadcast song change events consistently
+     */
+    private fun broadcastSongChange(song: Song) {
+        // Broadcast song change with all necessary details
+        val intent = Intent("com.cap.ultimatemusicplayer.SONG_CHANGED").apply {
+            putExtra("song_id", song.id)
+            putExtra("song_title", song.title)
+            putExtra("song_artist", song.artist)
+            putExtra("song_album", song.album)
+            putExtra("song_album_art_uri", song.albumArtUri)
+            putExtra("album_art_uri", song.albumArtUri) // Include both key formats for compatibility
+            putExtra("is_playing", _isPlaying)
+            addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
+        }
+        sendBroadcast(intent)
+        Log.d("MusicService", "Broadcasted song change: ${song.title} with album art URI: ${song.albumArtUri}")
+    }
+    
+    /**
+     * Play a song from a playlist with context of all songs in the playlist
+     */
+    fun playSong(song: Song, playlistSongs: List<Song>, position: Int) {
+        // Log details for debugging
+        Log.d("MusicService", "Playing song from playlist: ${song.title} at position $position")
+        Log.d("MusicService", "Album art URI: ${song.albumArtUri}")
+        
+        // Save the current playlist context
+        this.playlistSongs = playlistSongs
+        this.currentPlaylistPosition = position
+        this.isPlaylistActive = true
+        
+        // Play the selected song - this will trigger the regular playSong method
+        playSong(song)
+        
+        // Notify about playlist context change
+        val intent = Intent("com.cap.ultimatemusicplayer.SET_PLAYLIST").apply {
+            putExtra("current_position", position)
+            putExtra("playlist_active", true)
+            putExtra("song_id", song.id)  // Add song ID for reference
+            addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
+        }
+        sendBroadcast(intent)
+    }
+    
+    /**
+     * Play the next song in the current playlist context
+     */
+    fun playNextInPlaylist() {
+        if (!isPlaylistActive || playlistSongs.isNullOrEmpty() || currentPlaylistPosition < 0) {
+            // Fall back to regular next if no playlist context
+            Log.d("MusicService", "No playlist context, falling back to regular next")
+            playNext()
+            return
+        }
+        
+        Log.d("MusicService", "Playing next song in playlist. Current position: $currentPlaylistPosition, Total songs: ${playlistSongs?.size}")
+        
+        // Calculate next position
+        val nextPosition = when {
+            repeatMode == MainActivity.RepeatMode.ONE -> currentPlaylistPosition // Stay on current song
+            _isShuffleEnabled -> {
+                // Use shuffle logic here if needed
+                val random = java.util.Random()
+                random.nextInt(playlistSongs!!.size)
+            }
+            else -> {
+                val nextPos = (currentPlaylistPosition + 1) % playlistSongs!!.size
+                if (nextPos == 0 && repeatMode != MainActivity.RepeatMode.ALL) {
+                    // End of playlist without repeat all
+                    Log.d("MusicService", "End of playlist reached without repeat all")
+                    stopPlayback()
+                    return
+                }
+                nextPos
+            }
+        }
+        
+        // Play the next song
+        currentPlaylistPosition = nextPosition
+        val nextSong = playlistSongs!![nextPosition]
+        Log.d("MusicService", "Playing next song: ${nextSong.title} with album art: ${nextSong.albumArtUri}")
+        
+        // Play the song (this will trigger all necessary broadcasts)
+        playSong(nextSong)
+        
+        // Notify about playlist position change
+        val intent = Intent("com.cap.ultimatemusicplayer.SET_PLAYLIST").apply {
+            putExtra("current_position", nextPosition)
+            putExtra("playlist_active", true)
+            putExtra("song_id", nextSong.id)  // Include song ID for reference
+            addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
+        }
+        sendBroadcast(intent)
+    }
+    
+    /**
+     * Play the previous song in the current playlist context
+     */
+    fun playPreviousInPlaylist() {
+        if (!isPlaylistActive || playlistSongs.isNullOrEmpty() || currentPlaylistPosition < 0) {
+            // Fall back to regular previous if no playlist context
+            playPrevious()
+            return
+        }
+        
+        // Calculate previous position
+        val prevPosition = when {
+            repeatMode == MainActivity.RepeatMode.ONE -> currentPlaylistPosition // Stay on current song
+            _isShuffleEnabled -> {
+                // Use shuffle logic here if needed
+                val random = java.util.Random()
+                random.nextInt(playlistSongs!!.size)
+            }
+            else -> {
+                if (currentPlaylistPosition > 0) {
+                    currentPlaylistPosition - 1
+                } else if (repeatMode == MainActivity.RepeatMode.ALL) {
+                    playlistSongs!!.size - 1
+                } else {
+                    // Beginning of playlist without repeat
+                    return
+                }
+            }
+        }
+        
+        // Play the previous song
+        currentPlaylistPosition = prevPosition
+        val prevSong = playlistSongs!![prevPosition]
+        playSong(prevSong)
+        
+        // Notify about playlist position change
+        val intent = Intent("com.cap.ultimatemusicplayer.SET_PLAYLIST").apply {
+            putExtra("current_position", prevPosition)
+            putExtra("playlist_active", true)
+            addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
+        }
+        sendBroadcast(intent)
+    }
+    
+    /**
+     * Add a song to be played next in the queue
+     */
+    fun playNext(song: Song) {
+        // Send broadcast to MainActivity to handle adding song to play next
+        sendBroadcast(Intent("com.cap.ultimatemusicplayer.PLAYBACK_CONTROL").apply {
+            setPackage(packageName)
+            putExtra("command", "PLAY_NEXT_SONG")
+            putExtra("song_id", song.id)
+            putExtra("song_title", song.title)
+            putExtra("song_artist", song.artist)
+            putExtra("song_path", song.path)
+            putExtra("song_duration", song.duration)
+            putExtra("song_album", song.album)
+            putExtra("song_album_art_uri", song.albumArtUri)
+        })
+    }
+    
+    /**
+     * Add a song to the end of the queue
+     */
+    fun addToQueue(song: Song) {
+        // Send broadcast to MainActivity to handle adding song to queue
+        sendBroadcast(Intent("com.cap.ultimatemusicplayer.PLAYBACK_CONTROL").apply {
+            setPackage(packageName)
+            putExtra("command", "ADD_TO_QUEUE")
+            putExtra("song_id", song.id)
+            putExtra("song_title", song.title)
+            putExtra("song_artist", song.artist)
+            putExtra("song_path", song.path)
+            putExtra("song_duration", song.duration)
+            putExtra("song_album", song.album)
+            putExtra("song_album_art_uri", song.albumArtUri)
+        })
+    }
+    
+    /**
+     * Stop the current playback
+     */
+    private fun stopPlayback() {
+        try {
+            exoPlayer?.stop()
+            _isPlaying = false
+            sendPlaybackStateUpdate()
+            updateNotification()
+            handler.removeCallbacks(updateSeekBarRunnable)
+        } catch (e: Exception) {
+            Log.e("MusicService", "Error stopping playback", e)
         }
     }
 
@@ -698,6 +934,14 @@ class MusicService : Service() {
         return exoPlayer?.audioSessionId ?: 0
     }
 
+    /**
+     * Returns the current song being played
+     * Used by MainActivity to update UI
+     */
+    fun getCurrentSong(): Song? {
+        return currentSong
+    }
+
     private fun saveEqualizerSettings(): HashMap<Short, Short>? {
         if (equalizer == null) {
             Log.d("Equalizer", "No equalizer instance to save settings from")
@@ -819,13 +1063,48 @@ class MusicService : Service() {
         }
     }
 
+    /**
+     * Updates the currently playing song's title if it matches the given ID
+     * This is called when a song is renamed in the MainActivity
+     */
+    fun updateSongIfActive(songId: Long, newTitle: String) {
+        // If the song being updated is the currently playing song, update it
+        if (currentSong?.id == songId) {
+            // Update the object property
+            currentSong = currentSong?.copy(title = newTitle)
+            
+            // Update metadata
+            updateMediaSessionMetadata()
+            
+            // Update notification
+            updateNotification()
+            
+            // Broadcast song change to update UI in MainActivity
+            val song = currentSong ?: return
+            val intent = Intent("com.cap.ultimatemusicplayer.SONG_CHANGED").apply {
+                putExtra("song_id", song.id)
+                putExtra("song_title", song.title)
+                putExtra("song_artist", song.artist)
+                putExtra("song_album", song.album)
+                putExtra("song_album_art_uri", song.albumArtUri)
+                putExtra("album_art_uri", song.albumArtUri) // Include both key formats for compatibility
+                putExtra("is_playing", _isPlaying)
+            }
+            sendBroadcast(intent)
+            
+            Log.d("MusicService", "Updated currently playing song title to: $newTitle")
+        }
+    }
+
     private fun createNotification(song: Song): Notification {
         val notificationIntent = Intent(this, SongDetailsActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
             putExtra("song_id", song.id)
             putExtra("song_title", song.title)
             putExtra("song_artist", song.artist)
-            putExtra("album_art_uri", song.albumArtUri)
+            putExtra("song_album", song.album)
+            putExtra("song_album_art_uri", song.albumArtUri)
+            putExtra("album_art_uri", song.albumArtUri) // Add consistent key
             putExtra("is_playing", _isPlaying)
             putExtra("is_shuffle_enabled", _isShuffleEnabled)
             putExtra("repeat_mode", repeatMode.ordinal)

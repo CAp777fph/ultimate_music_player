@@ -8,6 +8,7 @@ import android.view.ViewGroup
 import androidx.fragment.app.Fragment
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import android.widget.Toast
 
 class SongsFragment : Fragment() {
     private lateinit var songsList: RecyclerView
@@ -39,8 +40,28 @@ class SongsFragment : Fragment() {
             songs = songs,
             onSongClick = { song ->
                 (activity as? MainActivity)?.let { mainActivity ->
-                    val songPosition = songs.indexOf(song)
-                    mainActivity.playSong(songPosition)
+                    // Get both lists of songs
+                    val mainActivitySongs = mainActivity.getSongs()
+                    
+                    // Try to find the song by ID in the MainActivity's list
+                    val mainActivityPosition = mainActivitySongs.indexOfFirst { it.id == song.id }
+                    
+                    if (mainActivityPosition >= 0) {
+                        // Found the song in MainActivity's list
+                        mainActivity.playSong(mainActivityPosition)
+                    } else {
+                        // Fallback: If the song isn't in MainActivity's current list,
+                        // we need to update MainActivity's song list first
+                        mainActivity.showAllSongs()
+                        // Now find the position again
+                        val newPosition = mainActivity.getSongs().indexOfFirst { it.id == song.id }
+                        if (newPosition >= 0) {
+                            mainActivity.playSong(newPosition)
+                        } else {
+                            // Still can't find it - this is unusual
+                            Toast.makeText(context, "Unable to play song: ${song.title}", Toast.LENGTH_SHORT).show()
+                        }
+                    }
                     
                     // Start SongDetailsActivity
                     val intent = Intent(context, SongDetailsActivity::class.java).apply {
@@ -86,8 +107,28 @@ class SongsFragment : Fragment() {
             songs = songs,
             onSongClick = { song ->
                 (activity as? MainActivity)?.let { mainActivity ->
-                    val songPosition = songs.indexOf(song)
-                    mainActivity.playSong(songPosition)
+                    // Get both lists of songs
+                    val mainActivitySongs = mainActivity.getSongs()
+                    
+                    // Try to find the song by ID in the MainActivity's list
+                    val mainActivityPosition = mainActivitySongs.indexOfFirst { it.id == song.id }
+                    
+                    if (mainActivityPosition >= 0) {
+                        // Found the song in MainActivity's list
+                        mainActivity.playSong(mainActivityPosition)
+                    } else {
+                        // Fallback: If the song isn't in MainActivity's current list,
+                        // we need to update MainActivity's song list first
+                        mainActivity.showAllSongs()
+                        // Now find the position again
+                        val newPosition = mainActivity.getSongs().indexOfFirst { it.id == song.id }
+                        if (newPosition >= 0) {
+                            mainActivity.playSong(newPosition)
+                        } else {
+                            // Still can't find it - this is unusual
+                            Toast.makeText(context, "Unable to play song: ${song.title}", Toast.LENGTH_SHORT).show()
+                        }
+                    }
                     
                     // Start SongDetailsActivity
                     val intent = Intent(context, SongDetailsActivity::class.java).apply {
@@ -113,4 +154,4 @@ class SongsFragment : Fragment() {
         
         songsList.adapter = songsAdapter
     }
-} 
+}

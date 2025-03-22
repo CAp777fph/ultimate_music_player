@@ -2,6 +2,7 @@ package com.cap.ultimatemusicplayer
 
 import android.Manifest
 import android.app.AlertDialog
+import android.app.RecoverableSecurityException
 import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
 import android.content.ComponentName
@@ -11,10 +12,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.IntentSender
-import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.media.MediaPlayer
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -53,6 +54,12 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import com.google.android.material.tabs.TabLayout
 import com.google.android.material.tabs.TabLayoutMediator
+import org.jaudiotagger.audio.AudioFileIO
+import org.jaudiotagger.audio.exceptions.CannotReadException
+import org.jaudiotagger.audio.exceptions.InvalidAudioFrameException
+import org.jaudiotagger.audio.exceptions.ReadOnlyFileException
+import org.jaudiotagger.tag.FieldKey
+import org.jaudiotagger.tag.Tag
 import java.io.File
 
 class MainActivity : AppCompatActivity() {
@@ -119,7 +126,53 @@ class MainActivity : AppCompatActivity() {
     private val playlistUpdateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == "com.cap.ultimatemusicplayer.PLAYLIST_UPDATED") {
-                updatePlaylistCount()
+                // Get the count directly from the intent
+                val count = intent.getIntExtra("playlist_count", -1)
+                Log.d("MainActivity", "Received playlist update broadcast with count: $count")
+                
+                if (count >= 0) {
+                    // Direct update with the count from the broadcast
+                    Handler(Looper.getMainLooper()).post {
+                        if (::playlistCount.isInitialized) {
+                            playlistCount.text = count.toString()
+                            playlistCount.invalidate()
+                            
+                            // Also update card visibility
+                            findViewById<MaterialCardView>(R.id.playList)?.apply {
+                                alpha = if (count == 0) 0.5f else 1.0f
+                                invalidate()
+                            }
+                            
+                            Log.d("MainActivity", "Directly updated playlist count UI to: $count")
+                        }
+                    }
+                } else {
+                    // Fallback to the old method if count wasn't included
+                    updatePlaylistCount(true)
+                }
+            }
+        }
+    }
+
+    // Add this as a class property
+    private val songChangedReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == "com.cap.ultimatemusicplayer.SONG_CHANGED") {
+                // Update UI with the currently playing song info
+                musicService?.let { service ->
+                    // Update song title if playing
+                    service.getCurrentSong()?.let { song ->
+                        songTitle.text = song.title
+                    }
+                    
+                    // Update playback UI
+                    updatePlaybackUI(service.isPlaying)
+                }
+                
+                // If the song was renamed, the adapter needs to be refreshed
+                songsAdapter.notifyDataSetChanged()
+                
+                Log.d("MainActivity", "Song changed broadcast received, UI updated")
             }
         }
     }
@@ -343,18 +396,31 @@ class MainActivity : AppCompatActivity() {
         override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
             return when (item.itemId) {
                 R.id.action_delete -> {
-                    val selectedSongs = songsAdapter.getSelectedSongs()
+                    val selectedIds = songsAdapter.getSelectedSongs()
+                    val selectedSongs = songs.filter { song -> selectedIds.contains(song.id) }
                     if (selectedSongs.isNotEmpty()) {
-                    showDeleteConfirmationDialog()
+                        showDeleteConfirmationDialog(selectedSongs) { confirmed ->
+                            if (confirmed) {
+                                deleteSongs(selectedSongs)
+                            }
+                        }
                     }
                     true
                 }
                 R.id.action_rename -> {
-                    showRenameDialog()
+                    val selectedIds = songsAdapter.getSelectedSongs()
+                    val selectedSong = songs.find { it.id == selectedIds.first() }
+                    if (selectedSong != null) {
+                        showRenameDialog(selectedSong)
+                    } else {
+                        Toast.makeText(this@MainActivity, "Error: Selected song not found", Toast.LENGTH_SHORT).show()
+                    }
                     true
                 }
                 R.id.action_share -> {
-                    shareSongs()
+                    val selectedIds = songsAdapter.getSelectedSongs()
+                    val selectedSongs = songs.filter { song -> selectedIds.contains(song.id) }
+                    shareSongs(selectedSongs)
                     true
                 }
                 else -> false
@@ -370,7 +436,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private val serviceConnection = object : ServiceConnection {
+    private val serviceConnection = object : android.content.ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = service as MusicService.MusicBinder
             musicService = binder.getService()
@@ -419,7 +485,11 @@ class MainActivity : AppCompatActivity() {
 
         // Register playlist update receiver
         val playlistUpdateFilter = IntentFilter("com.cap.ultimatemusicplayer.PLAYLIST_UPDATED")
-        registerReceiver(playlistUpdateReceiver, playlistUpdateFilter)
+        registerReceiver(playlistUpdateReceiver, playlistUpdateFilter, Context.RECEIVER_NOT_EXPORTED)
+
+        // Register song changed receiver
+        val songChangedFilter = IntentFilter("com.cap.ultimatemusicplayer.SONG_CHANGED")
+        registerReceiver(songChangedReceiver, songChangedFilter, Context.RECEIVER_NOT_EXPORTED)
 
         // Bind to MusicService
         Intent(this, MusicService::class.java).also { intent ->
@@ -452,6 +522,9 @@ class MainActivity : AppCompatActivity() {
         
         // Update ArtistsFragment if it exists
         (supportFragmentManager.fragments.find { it is ArtistsFragment } as? ArtistsFragment)?.updateArtists(artists)
+        
+        // Apply renamed song titles from SharedPreferences
+        applyRenamedSongTitles()
     }
 
     private fun initializeViews() {
@@ -555,24 +628,12 @@ class MainActivity : AppCompatActivity() {
         }.toTypedArray()
 
         if (permissionsToRequest.isEmpty()) {
-            // Verify we have both READ and WRITE permissions
-            val hasReadPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED
-            } else {
-                ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
-            }
-
-            val hasWritePermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                // For Android 13 and above, we don't need explicit WRITE permission
-                true
-            } else {
-                ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
-            }
-
-            if (hasReadPermission && hasWritePermission) {
+            // All basic permissions are granted
             loadSongs()
-            } else {
-                permissionLauncher.launch(requiredPermissions)
+            
+            // For Android 10 and above, we also need to check for special access permissions
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                requestManageExternalStoragePermission()
             }
         } else {
             permissionLauncher.launch(permissionsToRequest)
@@ -595,6 +656,46 @@ class MainActivity : AppCompatActivity() {
                 ).show()
             }
             .show()
+    }
+
+    private fun requestManageExternalStoragePermission() {
+        // For Android 10 and above, try to request broader access for media management
+        // This will help with rename and delete operations without individual prompts
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                // We'll save a preference to track if we've already asked for this
+                val prefs = getSharedPreferences("app_permissions", Context.MODE_PRIVATE)
+                val hasAskedForBroadAccess = prefs.getBoolean("asked_for_broad_access", false)
+                
+                if (!hasAskedForBroadAccess) {
+                    AlertDialog.Builder(this)
+                        .setTitle("Additional Permissions Needed")
+                        .setMessage("To rename and delete songs without being prompted each time, this app needs special access to manage all media files. Would you like to grant this permission now?")
+                        .setPositiveButton("Grant Access") { _, _ ->
+                            try {
+                                // On Android 11+ we would use ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION
+                                // but for Android 10 we'll use a more general approach
+                                val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+                                startActivityForResult(intent, MANAGE_EXTERNAL_STORAGE_REQUEST)
+                                
+                                // Mark that we've asked regardless of the outcome
+                                prefs.edit().putBoolean("asked_for_broad_access", true).apply()
+                            } catch (e: Exception) {
+                                Log.e("MainActivity", "Error requesting storage access: ${e.message}")
+                                Toast.makeText(this, "Unable to request broad file access", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                        .setNegativeButton("Not Now") { _, _ ->
+                            // Mark as asked so we don't keep bothering the user
+                            prefs.edit().putBoolean("asked_for_broad_access", true).apply()
+                            Toast.makeText(this, "You may be prompted for permission when renaming or deleting songs", Toast.LENGTH_LONG).show()
+                        }
+                        .show()
+                }
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Error with permission dialog: ${e.message}")
+            }
+        }
     }
 
     private fun loadSongs() {
@@ -863,6 +964,13 @@ class MainActivity : AppCompatActivity() {
         val songsToPlay = currentAlbumSongs ?: songs
         if (songsToPlay.isEmpty()) {
             Toast.makeText(this, "No songs available", Toast.LENGTH_SHORT).show()
+            return
+        }
+        
+        // Add bounds checking to prevent IndexOutOfBoundsException
+        if (position < 0 || position >= songsToPlay.size) {
+            Log.e("MainActivity", "Error: Invalid song position: $position, list size: ${songsToPlay.size}")
+            Toast.makeText(this, "Cannot play song at position $position (max: ${songsToPlay.size-1})", Toast.LENGTH_SHORT).show()
             return
         }
 
@@ -1243,130 +1351,21 @@ class MainActivity : AppCompatActivity() {
         return String.format("%d:%02d", minutes, seconds)
     }
 
-    private fun sendSeekBarUpdate() {
-        musicService?.let { service ->
-            val intent = Intent("com.cap.ultimatemusicplayer.SEEKBAR_UPDATE").apply {
-                setPackage(packageName)
-                putExtra("current_position", service.playerPosition)
-                putExtra("duration", service.duration)
-            }
-            sendBroadcast(intent)
-        }
-    }
-
-    private fun playNextBasedOnMode() {
-        when {
-            repeatMode == RepeatMode.ONE -> {
-                // Repeat the same song
-                playSong(currentSongPosition)
-                
-                // Send update to SongDetailsActivity
-                val currentSong = songs[currentSongPosition]
-                sendBroadcast(Intent("com.cap.ultimatemusicplayer.SONG_CHANGED").apply {
-                    setPackage(packageName)
-                    putExtra("song_id", currentSong.id)
-                    putExtra("song_title", currentSong.title)
-                    putExtra("song_artist", currentSong.artist)
-                    putExtra("album_art_uri", currentSong.albumArtUri)
-                    putExtra("is_favorite", currentSong.isFavorite)
-                })
-            }
-            isShuffleEnabled -> {
-                // Play next shuffled song
-                currentShuffleIndex = (currentShuffleIndex + 1) % shuffledIndices.size
-                val newPosition = shuffledIndices[currentShuffleIndex]
-                playSong(newPosition)
-                
-                // Send update to SongDetailsActivity
-                val currentSong = songs[newPosition]
-                sendBroadcast(Intent("com.cap.ultimatemusicplayer.SONG_CHANGED").apply {
-                    setPackage(packageName)
-                    putExtra("song_id", currentSong.id)
-                    putExtra("song_title", currentSong.title)
-                    putExtra("song_artist", currentSong.artist)
-                    putExtra("album_art_uri", currentSong.albumArtUri)
-                    putExtra("is_favorite", currentSong.isFavorite)
-                })
-            }
-            else -> {
-                // Normal sequential play
-                val nextPosition = (currentSongPosition + 1) % songs.size
-                if (nextPosition == 0 && repeatMode != RepeatMode.ALL) {
-                    // Stop playing if we've reached the end and repeat all is not enabled
-                    stopPlayback()
-                } else {
-                    playSong(nextPosition)
-                    
-                    // Send update to SongDetailsActivity
-                    val currentSong = songs[nextPosition]
-                    sendBroadcast(Intent("com.cap.ultimatemusicplayer.SONG_CHANGED").apply {
-                        setPackage(packageName)
-                        putExtra("song_id", currentSong.id)
-                        putExtra("song_title", currentSong.title)
-                        putExtra("song_artist", currentSong.artist)
-                        putExtra("album_art_uri", currentSong.albumArtUri)
-                        putExtra("is_favorite", currentSong.isFavorite)
-                    })
-                }
-            }
-        }
-    }
-
-    private fun stopPlayback() {
-        musicService?.let {
-        isPlaying = false
-        updatePlaybackUI(false)
-            handler.removeCallbacks(::updateSeekBar)
-        }
-        actionMode?.finish()
-    }
-
-    private fun showSortOptions() {
-        val options = arrayOf("Title (A-Z)", "Title (Z-A)", "Artist (A-Z)", "Artist (Z-A)", "Album", "Date Added")
-        MaterialAlertDialogBuilder(this)
-            .setTitle("Sort Songs")
-            .setItems(options) { _, which ->
-                when (which) {
-                    0 -> sortSongs { it.title.lowercase() }
-                    1 -> sortSongsDescending { it.title.lowercase() }
-                    2 -> sortSongs { it.artist.lowercase() }
-                    3 -> sortSongsDescending { it.artist.lowercase() }
-                    4 -> sortSongs { it.album.lowercase() }
-                    5 -> sortSongs { it.id }
-                }
-            }
-            .show()
-    }
-
-    private fun <T : Comparable<T>> sortSongs(selector: (Song) -> T) {
-        val sortedSongs = songs.sortedBy(selector)
-        songs.clear()
-        songs.addAll(sortedSongs)
-        songsAdapter.updateSongs(songs)
-    }
-
-    private fun <T : Comparable<T>> sortSongsDescending(selector: (Song) -> T) {
-        val sortedSongs = songs.sortedByDescending(selector)
-        songs.clear()
-        songs.addAll(sortedSongs)
-        songsAdapter.updateSongs(songs)
-    }
-
     private fun sendPlaybackStateUpdate() {
         val intent = Intent("com.cap.ultimatemusicplayer.PLAYBACK_STATE_UPDATE").apply {
             putExtra("is_playing", mediaPlayer?.isPlaying ?: false)
             putExtra("is_shuffle_enabled", isShuffleEnabled)
-            putExtra("repeat_mode", repeatMode)
+            putExtra("repeat_mode", repeatMode.ordinal)
             putExtra("is_muted", isMuted)
-            }
-            sendBroadcast(intent)
+        }
+        sendBroadcast(intent)
     }
 
     private fun sendPlaybackStateUpdate(isMuted: Boolean) {
         val intent = Intent("com.cap.ultimatemusicplayer.PLAYBACK_STATE_UPDATE").apply {
             putExtra("is_playing", mediaPlayer?.isPlaying ?: false)
             putExtra("is_shuffle_enabled", isShuffleEnabled)
-            putExtra("repeat_mode", repeatMode)
+            putExtra("repeat_mode", repeatMode.ordinal)
             putExtra("is_muted", isMuted)
         }
         sendBroadcast(intent)
@@ -1377,377 +1376,6 @@ class MainActivity : AppCompatActivity() {
         favoriteSongCount.text = count.toString()
         // Update the favorite card visibility based on count
         favoriteSongCard.alpha = if (count > 0) 1.0f else 0.5f
-    }
-
-    private fun showDeleteConfirmationDialog() {
-        val selectedSongIds = songsAdapter.getSelectedSongs()
-        if (selectedSongIds.isEmpty()) {
-            Toast.makeText(this, "No songs selected", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val message = if (selectedSongIds.size == 1) {
-            "Are you sure you want to delete this song?"
-        } else {
-            "Are you sure you want to delete ${selectedSongIds.size} songs?"
-        }
-
-        MaterialAlertDialogBuilder(this)
-            .setTitle("Delete Songs")
-            .setMessage(message)
-            .setPositiveButton("Delete") { _, _ ->
-                val selectedSongs = songs.filter { selectedSongIds.contains(it.id) }
-                deleteSongs(selectedSongs)
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
-    private fun deleteSongs(songs: List<Song>) {
-        try {
-            var successCount = 0
-            var failureCount = 0
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                // For Android 11+ (API 30+), use MediaStore.createDeleteRequest
-                val urisToDelete = songs.mapNotNull { song ->
-                    try {
-                        ContentUris.withAppendedId(Media.EXTERNAL_CONTENT_URI, song.id)
-                    } catch (e: Exception) {
-                        Log.e("MainActivity", "Error creating URI for song ${song.title}: ${e.message}")
-                        null
-                    }
-                }
-
-                if (urisToDelete.isNotEmpty()) {
-                    Log.d("MainActivity", "Using MediaStore.createDeleteRequest for ${urisToDelete.size} songs")
-                    
-                    try {
-                        val pendingIntent = MediaStore.createDeleteRequest(contentResolver, urisToDelete)
-                        startIntentSenderForResult(
-                            pendingIntent.intentSender,
-                            DELETE_REQUEST_CODE,
-                            null,
-                            0,
-                            0,
-                            0
-                        )
-                        // Result will be handled in onActivityResult
-                        return
-                    } catch (e: Exception) {
-                        Log.e("MainActivity", "Error with createDeleteRequest: ${e.message}", e)
-                        // Fall back to traditional method if this fails
-                    }
-                }
-            }
-
-            // Traditional method for older Android versions or as fallback
-            songs.forEach { song ->
-                try {
-                    Log.d("MainActivity", "Attempting to delete song: ${song.title}")
-                    Log.d("MainActivity", "Song path: ${song.path}")
-                    Log.d("MainActivity", "Song ID: ${song.id}")
-
-                    // First try to delete from MediaStore
-                    val deleted = contentResolver.delete(
-                        Media.EXTERNAL_CONTENT_URI,
-                        "${Media._ID} = ?",
-                        arrayOf(song.id.toString())
-                    )
-                    Log.d("MainActivity", "MediaStore deletion result: $deleted")
-
-                    if (deleted > 0) {
-                        successCount++
-                        Log.d("MainActivity", "Successfully deleted song from MediaStore")
-                        
-                        // After successful MediaStore deletion, try to delete physical file
-                val file = File(song.path)
-                if (file.exists()) {
-                            Log.d("MainActivity", "Physical file exists, attempting to delete")
-                            if (file.delete()) {
-                                Log.d("MainActivity", "Physical file deleted successfully")
-                            } else {
-                                Log.e("MainActivity", "Failed to delete physical file. File permissions: ${file.canRead()}, ${file.canWrite()}")
-                            }
-                        } else {
-                            Log.d("MainActivity", "Physical file does not exist")
-                        }
-                    } else {
-                        // If MediaStore deletion fails, try alternative method
-                        val values = ContentValues().apply {
-                            put(Media.IS_MUSIC, 0)
-                        }
-                        val updated = contentResolver.update(
-                        Media.EXTERNAL_CONTENT_URI,
-                            values,
-                        "${Media._ID} = ?",
-                        arrayOf(song.id.toString())
-                    )
-                        if (updated > 0) {
-                            successCount++
-                            Log.d("MainActivity", "Successfully marked song as non-music in MediaStore")
-                        } else {
-                            failureCount++
-                            Log.e("MainActivity", "Failed to update MediaStore entry: ${song.id}")
-                            
-                            // Try to get more information about the failure
-                            try {
-                                val cursor = contentResolver.query(
-                                    Media.EXTERNAL_CONTENT_URI,
-                                    arrayOf(Media._ID, Media.DATA),
-                                    "${Media._ID} = ?",
-                                    arrayOf(song.id.toString()),
-                                    null
-                                )
-                                cursor?.use {
-                                    if (it.moveToFirst()) {
-                                        Log.e("MainActivity", "File still exists in MediaStore. Path: ${it.getString(1)}")
-                                    } else {
-                                        Log.e("MainActivity", "File not found in MediaStore")
-                                    }
-                                }
-                            } catch (e: Exception) {
-                                Log.e("MainActivity", "Error checking MediaStore status: ${e.message}")
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    failureCount++
-                    Log.e("MainActivity", "Error deleting song ${song.title}: ${e.message}", e)
-                }
-            }
-
-            // Refresh the song list
-            loadSongs()
-            
-            // Exit selection mode
-            actionMode?.finish()
-
-            // Show appropriate message
-            when {
-                successCount > 0 && failureCount == 0 -> {
-                    Toast.makeText(this, "Successfully deleted $successCount song(s)", Toast.LENGTH_SHORT).show()
-                }
-                successCount > 0 && failureCount > 0 -> {
-                    Toast.makeText(this, "Deleted $successCount song(s), failed to delete $failureCount", Toast.LENGTH_SHORT).show()
-                }
-                else -> {
-                    Toast.makeText(this, "Failed to delete songs. Please check app permissions.", Toast.LENGTH_SHORT).show()
-                }
-            }
-        } catch (e: Exception) {
-            Log.e("MainActivity", "Error in deleteSongs: ${e.message}", e)
-            Toast.makeText(this, "Error deleting songs", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun showRenameDialog() {
-        val selectedSongIds = songsAdapter.getSelectedSongs()
-        if (selectedSongIds.isEmpty()) return
-
-        val selectedSongId = selectedSongIds.first()
-        val song = songs.find { it.id == selectedSongId } ?: return
-
-        val input = EditText(this).apply {
-            setText(song.title)
-            hint = "Enter new name"
-            setTextColor(ContextCompat.getColor(context, R.color.text_primary))
-            setHintTextColor(ContextCompat.getColor(context, R.color.text_secondary))
-        }
-
-        MaterialAlertDialogBuilder(this)
-            .setTitle("Rename Song")
-            .setView(input)
-            .setPositiveButton("Rename") { _, _ ->
-                val newName = input.text.toString()
-                if (newName.isNotEmpty()) {
-                    renameSong(song, newName)
-                }
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
-    private fun renameSong(song: Song, newTitle: String) {
-        try {
-            // Update MediaStore
-            val values = ContentValues().apply {
-                put(Media.TITLE, newTitle)
-            }
-            contentResolver.update(
-                Media.EXTERNAL_CONTENT_URI,
-                values,
-                "${Media._ID} = ?",
-                arrayOf(song.id.toString())
-            )
-
-            // Update local song list
-            val songIndex = songs.indexOfFirst { it.id == song.id }
-            if (songIndex != -1) {
-                songs[songIndex] = songs[songIndex].copy(title = newTitle)
-            }
-
-            // Update current album songs if viewing album songs
-            if (isViewingAlbumSongs) {
-                currentAlbumSongs?.let { albumSongs ->
-                    val albumSongIndex = albumSongs.indexOfFirst { it.id == song.id }
-                    if (albumSongIndex != -1) {
-                        albumSongs[albumSongIndex] = albumSongs[albumSongIndex].copy(title = newTitle)
-                    }
-                }
-            }
-
-            // Update UI
-            songsAdapter.notifyDataSetChanged()
-            
-            // Exit selection mode
-            actionMode?.finish()
-            
-            Toast.makeText(this, "গানের নাম পরিবর্তন করা হয়েছে", Toast.LENGTH_SHORT).show()
-        } catch (e: Exception) {
-            Log.e("MainActivity", "Error renaming song: ${e.message}")
-            Toast.makeText(this, "গানের নাম পরিবর্তন করতে সমস্যা হচ্ছে", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun shareSongs() {
-        val selectedSongIds = songsAdapter.getSelectedSongs()
-        if (selectedSongIds.isEmpty()) return
-
-        try {
-            val selectedSongs = songs.filter { selectedSongIds.contains(it.id) }
-            if (selectedSongs.size == 1) {
-                // Share single song
-                val song = selectedSongs[0]
-                try {
-                    val file = File(song.path)
-                    
-                    if (!file.exists()) {
-                        Toast.makeText(this, "গানটি খুঁজে পাওয়া যায়নি", Toast.LENGTH_SHORT).show()
-                        return
-                    }
-
-                    // Create content URI using FileProvider
-                    val contentUri = try {
-                        FileProvider.getUriForFile(
-                            this,
-                            "${packageName}.provider",
-                            file
-                        )
-                    } catch (e: IllegalArgumentException) {
-                        Log.e("MainActivity", "Error creating content URI: ${e.message}")
-                        Toast.makeText(this, "গানটি শেয়ার করার জন্য অ্যাক্সেস পাওয়া যায়নি", Toast.LENGTH_SHORT).show()
-                        return
-                    }
-
-                    val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                        type = "audio/*"
-                        putExtra(Intent.EXTRA_STREAM, contentUri)
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    }
-
-                    try {
-                        startActivity(Intent.createChooser(shareIntent, "শেয়ার করুন: ${song.title}"))
-                    } catch (e: ActivityNotFoundException) {
-                        Toast.makeText(this, "শেয়ার করার জন্য কোন অ্যাপ পাওয়া যায়নি", Toast.LENGTH_SHORT).show()
-                    }
-                } catch (e: SecurityException) {
-                    Log.e("MainActivity", "Security Exception: ${e.message}")
-                    Toast.makeText(this, "গানটি শেয়ার করার অনুমতি নেই", Toast.LENGTH_SHORT).show()
-                }
-            } else {
-                // Share multiple songs
-                val uris = ArrayList<Uri>()
-                var failedCount = 0
-                
-                selectedSongs.forEach { song ->
-                    try {
-                        val file = File(song.path)
-                        if (!file.exists()) {
-                            failedCount++
-                            return@forEach
-                        }
-
-                        val uri = FileProvider.getUriForFile(
-                            this,
-                            "${packageName}.provider",
-                            file
-                        )
-                        uris.add(uri)
-                    } catch (e: Exception) {
-                        Log.e("MainActivity", "Error processing song: ${song.title}, Error: ${e.message}")
-                        failedCount++
-                    }
-                }
-
-                if (uris.isEmpty()) {
-                    Toast.makeText(this, "কোনো গান শেয়ার করার জন্য প্রস্তুত নেই", Toast.LENGTH_SHORT).show()
-                    return
-                }
-
-                val shareIntent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
-                    type = "audio/*"
-                    putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                }
-
-                try {
-                    val title = if (failedCount > 0) {
-                        "শেয়ার করুন: ${convertToBengaliNumerals(uris.size)}টি গান (${convertToBengaliNumerals(failedCount)}টি বাদ গেছে)"
-                    } else {
-                        "শেয়ার করুন: ${convertToBengaliNumerals(uris.size)}টি গান"
-                    }
-                    startActivity(Intent.createChooser(shareIntent, title))
-                } catch (e: ActivityNotFoundException) {
-                    Toast.makeText(this, "শেয়ার করার জন্য কোন অ্যাপ পাওয়া যায়নি", Toast.LENGTH_SHORT).show()
-                }
-            }
-            actionMode?.finish()
-        } catch (e: Exception) {
-            Log.e("MainActivity", "Share error: ${e.message}")
-            Toast.makeText(this, "গান শেয়ার করতে সমস্যা হয়েছে", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun updatePlaybackUI(isPlaying: Boolean) {
-        this.isPlaying = isPlaying
-        playPauseButton.setImageResource(if (isPlaying) R.drawable.ic_pause else R.drawable.ic_play)
-        updateBottomControlsVisibility(isPlaying)
-        if (isPlaying) {
-            handler.post(::updateSeekBar)
-        } else {
-            handler.removeCallbacks(::updateSeekBar)
-        }
-    }
-
-    private fun updateBottomControlsVisibility(isPlaying: Boolean) {
-        bottomPlaybackControls.visibility = if (isPlaying || currentSongPosition != -1) View.VISIBLE else View.GONE
-    }
-
-    private fun updateUnplayedCount() {
-        val unplayedCount = songs.count { it.playCount == 0 }
-        unplayedSongCount.text = unplayedCount.toString()
-    }
-
-    private fun updateMostPlayedCount() {
-        // Count songs that have been played at least once
-        val playedSongsCount = songs.count { it.playCount > 0 }
-        mostPlayedCount.text = playedSongsCount.toString()
-    }
-
-    private fun updateRepeatButton() {
-        val repeatIcon = when (repeatMode) {
-            RepeatMode.NONE -> R.drawable.ic_repeat // No repeat
-            RepeatMode.ALL -> R.drawable.ic_repeat_on // Repeat all
-            RepeatMode.ONE -> R.drawable.ic_repeat_one // Repeat one
-        }
-        repeatButton.setImageResource(repeatIcon)
-        repeatButton.setColorFilter(
-            if (repeatMode != RepeatMode.NONE)
-                ContextCompat.getColor(this, R.color.accent_color)
-            else
-                ContextCompat.getColor(this, R.color.white)
-        )
     }
 
     override fun onResume() {
@@ -1764,6 +1392,7 @@ class MainActivity : AppCompatActivity() {
             unregisterReceiver(playbackControlReceiver)
             unregisterReceiver(stateReceiver)
             unregisterReceiver(playlistUpdateReceiver)
+            unregisterReceiver(songChangedReceiver)
         } catch (e: Exception) {
             Log.e("MainActivity", "Error unregistering receiver: ${e.message}")
         }
@@ -1818,7 +1447,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun getArtistFromSong(song: Song): Artist {
+    fun getArtistFromSong(song: Song): Artist {
         val artistName = song.artist
         return artists.find { it.name == artistName } ?: Artist(
             name = artistName,
@@ -1918,7 +1547,7 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, "${folder.name} থেকে ${folder.songs.size}টি গান দেখানো হচ্ছে", Toast.LENGTH_SHORT).show()
     }
 
-    private fun showAllSongs() {
+    fun showAllSongs() {
         isViewingAlbumSongs = false
         backButton.visibility = View.GONE
         currentAlbumSongs = null
@@ -2075,13 +1704,28 @@ class MainActivity : AppCompatActivity() {
         currentView = ViewType.FOLDERS
     }
 
-    private fun updatePlaylistCount() {
+    private fun updatePlaylistCount(forceUpdate: Boolean = false) {
         try {
-            val playlists = playlistManager.getAllPlaylists()
-            playlistCount.text = playlists.size.toString()
+            // Make sure we're on the UI thread
+            if (Looper.myLooper() != Looper.getMainLooper()) {
+                Handler(Looper.getMainLooper()).post {
+                    updatePlaylistCount(forceUpdate)
+                }
+                return
+            }
+            
+            val playlists = playlistManager.getAllPlaylists(forceUpdate)
+            if (::playlistCount.isInitialized) {
+                playlistCount.text = playlists.size.toString()
+                // Force a UI refresh
+                playlistCount.invalidate()
+            }
             
             // Update the playlist card visibility based on count
-            findViewById<MaterialCardView>(R.id.playList)?.alpha = if (playlists.isEmpty()) 0.5f else 1.0f
+            findViewById<MaterialCardView>(R.id.playList)?.apply {
+                alpha = if (playlists.isEmpty()) 0.5f else 1.0f
+                invalidate() // Force redraw
+            }
             
             // Log for debugging
             Log.d("MainActivity", "Playlist count updated: ${playlists.size}")
@@ -2092,7 +1736,10 @@ class MainActivity : AppCompatActivity() {
 
     // Update this method to be called when playlists are modified
     fun refreshPlaylistCount() {
-        updatePlaylistCount()
+        // Run on UI thread to ensure immediate update
+        Handler(Looper.getMainLooper()).post {
+            updatePlaylistCount()
+        }
     }
 
     private fun getPlaylists(): List<Playlist> {
@@ -2101,21 +1748,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val DELETE_REQUEST_CODE = 1001
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == DELETE_REQUEST_CODE) {
-            if (resultCode == RESULT_OK) {
-                Log.d("MainActivity", "Delete request approved by user")
-                Toast.makeText(this, "Songs deleted successfully", Toast.LENGTH_SHORT).show()
-                loadSongs() // Refresh the song list
-                actionMode?.finish() // Exit selection mode
-            } else {
-                Log.d("MainActivity", "Delete request rejected by user or failed")
-                Toast.makeText(this, "Song deletion cancelled or failed", Toast.LENGTH_SHORT).show()
-            }
-        }
+        private const val MANAGE_EXTERNAL_STORAGE_REQUEST = 1003
     }
 
     private fun generateShuffleIndices() {
@@ -2123,5 +1756,539 @@ class MainActivity : AppCompatActivity() {
         shuffledIndices = (0 until songsToPlay.size).toMutableList()
         shuffledIndices.shuffle()
         currentShuffleIndex = shuffledIndices.indexOf(currentSongPosition)
+    }
+
+    private fun updateFileTags(filePath: String, newTitle: String): Boolean {
+        try {
+            val file = File(filePath)
+            if (file.exists()) {
+                val audioFile = org.jaudiotagger.audio.AudioFileIO.read(file)
+                val tag = audioFile.tagOrCreateAndSetDefault
+                tag.setField(org.jaudiotagger.tag.FieldKey.TITLE, newTitle)
+                audioFile.commit()
+                Log.d("MainActivity", "Successfully updated audio file tags for: $filePath")
+                return true
+            } else {
+                Log.e("MainActivity", "File does not exist: $filePath")
+            }
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error updating audio file tags: ${e.message}")
+        }
+        return false
+    }
+
+    private fun shareSongs(songs: List<Song>) {
+        if (songs.isEmpty()) return
+        
+        val shareIntent = Intent().apply {
+            action = Intent.ACTION_SEND_MULTIPLE
+            putExtra(Intent.EXTRA_SUBJECT, "Sharing ${songs.size} songs")
+            
+            val uris = songs.mapNotNull { song ->
+                try {
+                    val file = File(song.path)
+                    FileProvider.getUriForFile(this@MainActivity, "${applicationContext.packageName}.provider", file)
+                } catch (e: Exception) {
+                    Log.e("MainActivity", "Error creating URI for sharing: ${e.message}")
+                    null
+                }
+            }
+            
+            putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+            type = "audio/*"
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        
+        try {
+            startActivity(Intent.createChooser(shareIntent, "Share Songs"))
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error sharing songs: ${e.message}")
+            Toast.makeText(this, "Unable to share songs", Toast.LENGTH_SHORT).show()
+        }
+    }
+    
+    private fun applyRenamedSongTitles() {
+        val prefs = getSharedPreferences("RenamedSongs", Context.MODE_PRIVATE)
+        val allEntries = prefs.all
+        
+        if (allEntries.isEmpty()) return
+        
+        // Update songs in the adapter with the renamed titles
+        for (i in 0 until songs.size) {
+            val song = songs[i]
+            val newTitle = prefs.getString(song.id.toString(), null)
+            
+            if (newTitle != null) {
+                // Update the song title in the model
+                songs[i] = song.copy(title = newTitle)
+            }
+        }
+        
+        // Refresh the adapter
+        songsAdapter.updateSongs(songs)
+    }
+    
+    private fun updateUIAfterRename(songId: Long, newTitle: String) {
+        // Find and update the song in the songs list
+        for (i in 0 until songs.size) {
+            val song = songs[i]
+            if (song.id == songId) {
+                // Update the song title in the model
+                songs[i] = song.copy(title = newTitle)
+                break
+            }
+        }
+        
+        // Refresh the adapter
+        songsAdapter.updateSongs(songs)
+        
+        // If the renamed song is the current song, update the player UI
+        if (currentSongPosition != -1 && currentSongPosition < songs.size) {
+            val currentSong = songs[currentSongPosition]
+            if (currentSong.id == songId) {
+                songTitle?.text = newTitle
+            }
+        }
+    }
+    
+    private fun saveRenamedSongInfo(songId: Long, newTitle: String) {
+        val prefs = getSharedPreferences("RenamedSongs", Context.MODE_PRIVATE)
+        prefs.edit().putString(songId.toString(), newTitle).apply()
+        Log.d("MainActivity", "Saved renamed song info: ID=$songId, Title=$newTitle")
+    }
+
+    private fun deleteSongs(songs: List<Song>) {
+        if (songs.isEmpty()) return
+        
+        val songIdsToDelete = songs.map { it.id }
+        // Update the songs list (filter out the deleted songs)
+        val updatedSongs = this.songs.filter { !songIdsToDelete.contains(it.id) }.toMutableList()
+        this.songs = updatedSongs
+        
+        // Update adapter immediately
+        songsAdapter.updateSongs(this.songs)
+        
+        // Update UI counters
+        findViewById<TextView>(R.id.allSongCount)?.text = this.songs.size.toString()
+        updateFavoriteCount()
+        updateUnplayedCount()
+        updateMostPlayedCount()
+        
+        // Close action mode if active
+        actionMode?.finish()
+        
+        // Show a temporary message
+        val deletingToast = Toast.makeText(this, "Deleting ${songs.size} songs...", Toast.LENGTH_SHORT)
+        deletingToast.show()
+        exitSelectionMode()
+        
+        // Check if we have broad access
+        val hasBroadAccess = getSharedPreferences("app_permissions", Context.MODE_PRIVATE)
+            .getBoolean("has_broad_access", false)
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                // Android 11 and above: Use MediaStore API
+                val uris = songs.map { song ->
+                    ContentUris.withAppendedId(Media.EXTERNAL_CONTENT_URI, song.id)
+                }
+                
+                try {
+                    // Request delete permission by PendingIntent
+                    val pendingIntent = MediaStore.createDeleteRequest(contentResolver, uris)
+                    
+                    // If we have broad access, we might bypass this, but let's try it first
+                    // If it fails with RecoverableSecurityException, we'll handle it in the catch block
+                    startIntentSenderForResult(
+                        pendingIntent.intentSender,
+                        DELETE_REQUEST_CODE,
+                        null,
+                        0,
+                        0,
+                        0
+                    )
+                } catch (e: Exception) {
+                    if (hasBroadAccess) {
+                        // If we have broad access but still hit an exception, try to delete directly
+                        var successCount = 0
+                        for (uri in uris) {
+                            try {
+                                val deletedRows = contentResolver.delete(uri, null, null)
+                                if (deletedRows > 0) successCount++
+                            } catch (e2: Exception) {
+                                Log.e("MainActivity", "Error deleting with broad access: ${e2.message}")
+                            }
+                        }
+                        
+                        if (successCount > 0) {
+                            deletingToast.cancel() // Cancel the "deleting" toast
+                            Toast.makeText(this, "Deleted $successCount songs", Toast.LENGTH_SHORT).show()
+                            // We already updated the UI optimistically, no need to reload
+                        } else {
+                            // If failed, roll back our optimistic update
+                            deletingToast.cancel()
+                            Toast.makeText(this, "Failed to delete songs", Toast.LENGTH_SHORT).show()
+                            refreshSongsFromMediaStore()
+                        }
+                    } else {
+                        Log.e("MainActivity", "Error creating delete request: ${e.message}")
+                        Toast.makeText(this, "Error deleting songs: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+                
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // Android 10: Handle each URI individually with RecoverableSecurityException
+                val uris = songs.map { song ->
+                    ContentUris.withAppendedId(Media.EXTERNAL_CONTENT_URI, song.id)
+                }
+
+                // Try batch delete first, if it fails we'll handle in the catch block
+                try {
+                    var successCount = 0
+                    for (uri in uris) {
+                        val deletedRows = contentResolver.delete(uri, null, null)
+                        if (deletedRows > 0) successCount++
+                    }
+                    
+                    if (successCount > 0) {
+                        deletingToast.cancel()
+                        Toast.makeText(this, "Deleted $successCount songs", Toast.LENGTH_SHORT).show()
+                        // We already updated the UI optimistically, no need to reload
+                    } else {
+                        // If failed, roll back our optimistic update
+                        deletingToast.cancel()
+                        Toast.makeText(this, "No songs were deleted", Toast.LENGTH_SHORT).show()
+                        refreshSongsFromMediaStore()
+                    }
+                } catch (securityException: SecurityException) {
+                    if (securityException is android.app.RecoverableSecurityException && !hasBroadAccess) {
+                        // We can recover by asking for permission
+                        try {
+                            val intentSender = securityException.userAction.actionIntent.intentSender
+                            startIntentSenderForResult(
+                                intentSender,
+                                DELETE_REQUEST_CODE,
+                                null,
+                                0,
+                                0,
+                                0
+                            )
+                        } catch (e: IntentSender.SendIntentException) {
+                            Log.e("MainActivity", "Error launching permission intent: ${e.message}")
+                            Toast.makeText(this, "Error requesting permission", Toast.LENGTH_SHORT).show()
+                        }
+                    } else {
+                        // Some other security exception we can't handle
+                        deletingToast.cancel()
+                        Log.e("MainActivity", "Security exception deleting files: ${securityException.message}")
+                        Toast.makeText(this, "Permission denied to delete songs", Toast.LENGTH_SHORT).show()
+                        refreshSongsFromMediaStore() // Roll back optimistic update
+                    }
+                }
+                
+            } else {
+                // Android 9 and below: Direct file delete
+                var successCount = 0
+                for (song in songs) {
+                    val file = File(song.path)
+                    if (file.exists() && file.delete()) {
+                        // Delete from MediaStore
+                        contentResolver.delete(
+                            Media.EXTERNAL_CONTENT_URI,
+                            "${Media._ID} = ?",
+                            arrayOf(song.id.toString())
+                        )
+                        successCount++
+                    }
+                }
+
+                if (successCount > 0) {
+                    deletingToast.cancel()
+                    Toast.makeText(this, "Deleted $successCount songs", Toast.LENGTH_SHORT).show()
+                    // We already updated the UI optimistically
+                } else {
+                    // If failed, roll back our optimistic update
+                    deletingToast.cancel()
+                    Toast.makeText(this, "Failed to delete songs", Toast.LENGTH_SHORT).show()
+                    refreshSongsFromMediaStore()
+                }
+            }
+        } catch (e: Exception) {
+            // General exception handler
+            deletingToast.cancel()
+            Log.e("MainActivity", "Error deleting songs: ${e.message}")
+            Toast.makeText(this, "Error deleting songs: ${e.message}", Toast.LENGTH_SHORT).show()
+            refreshSongsFromMediaStore() // Roll back optimistic update
+        }
+    }
+
+    private fun showDeleteConfirmationDialog(songs: List<Song>, callback: (Boolean) -> Unit) {
+        val message = if (songs.size == 1) {
+            "Are you sure you want to delete '${songs[0].title}'?"
+        } else {
+            "Are you sure you want to delete ${songs.size} songs?"
+        }
+        
+        AlertDialog.Builder(this)
+            .setTitle("Delete Song")
+            .setMessage(message)
+            .setPositiveButton("Delete") { _, _ -> callback(true) }
+            .setNegativeButton("Cancel") { _, _ -> callback(false) }
+            .show()
+    }
+
+    private fun renameSongModern(song: Song, newTitle: String) {
+        // First, update UI optimistically
+        // Show a toast indicating rename in progress
+        val renamingToast = Toast.makeText(this, "Renaming song...", Toast.LENGTH_SHORT)
+        renamingToast.show()
+        exitSelectionMode()
+        
+        // Update UI immediately (optimistic update)
+        updateUIAfterRename(song.id, newTitle)
+        // Save to preferences for persistence across app restarts
+        saveRenamedSongInfo(song.id, newTitle)
+        
+        // First check if we have broad access
+        val hasBroadAccess = getSharedPreferences("app_permissions", Context.MODE_PRIVATE)
+            .getBoolean("has_broad_access", false)
+
+        // Get content URI for the song
+        val contentUri = Media.EXTERNAL_CONTENT_URI
+        val songUri = ContentUris.withAppendedId(contentUri, song.id)
+        
+        try {
+            // Update MediaStore
+            val values = ContentValues().apply {
+                put(MediaStore.Audio.Media.TITLE, newTitle)
+                put(MediaStore.Audio.Media.DISPLAY_NAME, "$newTitle${File(song.path).extension?.let { ".$it" } ?: ""}")
+            }
+            
+            val rowsUpdated = contentResolver.update(songUri, values, null, null)
+            if (rowsUpdated > 0) {
+                Log.d("MainActivity", "Successfully updated MediaStore: $rowsUpdated rows")
+                // Update the file tags using JAudioTagger for better compatibility
+                updateFileTags(song.path, newTitle)
+                // Cancel the "renaming" toast
+                renamingToast.cancel()
+                Toast.makeText(this, "Song renamed successfully", Toast.LENGTH_SHORT).show()
+                // UI is already updated, no need to update again
+            } else {
+                Log.e("MainActivity", "Failed to update MediaStore: $rowsUpdated rows")
+                renamingToast.cancel()
+                Toast.makeText(this, "Failed to rename song", Toast.LENGTH_SHORT).show()
+                // Don't revert the UI here - the user might still see the new name in the app
+                // even if MediaStore failed to update
+            }
+        } catch (securityException: SecurityException) {
+            // This is expected on Android 10+ for files not created by the app
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                if (securityException is android.app.RecoverableSecurityException) {
+                    Log.d("MainActivity", "Caught RecoverableSecurityException, requesting user permission")
+                    
+                    // If we already tried to get broad access and user declined, or if we haven't tried yet
+                    if (!hasBroadAccess) {
+                        val intentSender = securityException.userAction.actionIntent.intentSender
+                        try {
+                            // Save pending operation details
+                            pendingRenameUri = songUri
+                            pendingRenameTitle = newTitle
+                            pendingRenameSong = song
+                            
+                            // Request permission from user
+                            startIntentSenderForResult(
+                                intentSender,
+                                RENAME_REQUEST_CODE,
+                                null,
+                                0,
+                                0,
+                                0
+                            )
+                        } catch (e: IntentSender.SendIntentException) {
+                            Log.e("MainActivity", "Error launching permission intent: ${e.message}")
+                            renamingToast.cancel()
+                            Toast.makeText(this, "Error requesting permission to rename song", Toast.LENGTH_SHORT).show()
+                        }
+                    } else {
+                        // If we got here with broad access, it means our broad access isn't working correctly
+                        // Let's suggest requesting it again
+                        renamingToast.cancel()
+                        Toast.makeText(this, "Permission error. Try granting storage access in settings", Toast.LENGTH_SHORT).show()
+                    }
+                    return
+                }
+            }
+            
+            // For other types of security exceptions or older Android versions
+            Log.e("MainActivity", "Security exception renaming file: ${securityException.message}")
+            renamingToast.cancel()
+            Toast.makeText(this, "Permission denied to rename song", Toast.LENGTH_SHORT).show()
+            
+            // Try using JAudioTagger as fallback
+            if (updateFileTags(song.path, newTitle)) {
+                // Scan the file so MediaStore picks up the changes
+                MediaScannerConnection.scanFile(
+                    this,
+                    arrayOf(song.path),
+                    null
+                ) { _, _ ->
+                    Log.d("MainActivity", "Media scan completed after tag update")
+                    // UI is already updated, no need to update again
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error renaming song: ${e.message}")
+            renamingToast.cancel()
+            Toast.makeText(this, "Error renaming song: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun showRenameDialog(song: Song) {
+        val editText = EditText(this).apply {
+            setText(song.title)
+            setSelection(0, song.title.length)
+            setSingleLine(true)
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Rename Song")
+            .setView(editText)
+            .setPositiveButton("Rename") { _, _ ->
+                val newTitle = editText.text.toString().trim()
+                if (newTitle.isNotEmpty() && newTitle != song.title) {
+                    renameSongModern(song, newTitle)
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private val RENAME_REQUEST_CODE = 103
+    private var pendingRenameUri: Uri? = null
+    private var pendingRenameTitle: String? = null
+    private var pendingRenameSong: Song? = null
+
+    private fun playNextBasedOnMode() {
+        when {
+            repeatMode == RepeatMode.ONE -> {
+                // Repeat the same song
+                playSong(currentSongPosition)
+                
+                // Send update to SongDetailsActivity
+                val currentSong = songs[currentSongPosition]
+                sendBroadcast(Intent("com.cap.ultimatemusicplayer.SONG_CHANGED").apply {
+                    setPackage(packageName)
+                    putExtra("song_id", currentSong.id)
+                    putExtra("song_title", currentSong.title)
+                    putExtra("song_artist", currentSong.artist)
+                    putExtra("album_art_uri", currentSong.albumArtUri)
+                    putExtra("is_favorite", currentSong.isFavorite)
+                })
+            }
+            isShuffleEnabled -> {
+                // Play next shuffled song
+                currentShuffleIndex = (currentShuffleIndex + 1) % shuffledIndices.size
+                val newPosition = shuffledIndices[currentShuffleIndex]
+                playSong(newPosition)
+                
+                // Send update to SongDetailsActivity
+                val currentSong = songs[newPosition]
+                sendBroadcast(Intent("com.cap.ultimatemusicplayer.SONG_CHANGED").apply {
+                    setPackage(packageName)
+                    putExtra("song_id", currentSong.id)
+                    putExtra("song_title", currentSong.title)
+                    putExtra("song_artist", currentSong.artist)
+                    putExtra("album_art_uri", currentSong.albumArtUri)
+                    putExtra("is_favorite", currentSong.isFavorite)
+                })
+            }
+            else -> {
+                // Normal sequential play
+                val nextPosition = (currentSongPosition + 1) % songs.size
+                if (nextPosition == 0 && repeatMode != RepeatMode.ALL) {
+                    // Stop playing if we've reached the end and repeat all is not enabled
+                    stopPlayback()
+                } else {
+                    playSong(nextPosition)
+                    
+                    // Send update to SongDetailsActivity
+                    val currentSong = songs[nextPosition]
+                    sendBroadcast(Intent("com.cap.ultimatemusicplayer.SONG_CHANGED").apply {
+                        setPackage(packageName)
+                        putExtra("song_id", currentSong.id)
+                        putExtra("song_title", currentSong.title)
+                        putExtra("song_artist", currentSong.artist)
+                        putExtra("album_art_uri", currentSong.albumArtUri)
+                        putExtra("is_favorite", currentSong.isFavorite)
+                    })
+                }
+            }
+        }
+    }
+
+    private fun stopPlayback() {
+        musicService?.let {
+            isPlaying = false
+            updatePlaybackUI(false)
+            handler.removeCallbacks(::updateSeekBar)
+        }
+        actionMode?.finish()
+    }
+
+    private fun updatePlaybackUI(isPlaying: Boolean) {
+        this.isPlaying = isPlaying
+        playPauseButton.setImageResource(if (isPlaying) R.drawable.ic_pause else R.drawable.ic_play)
+        updateBottomControlsVisibility(isPlaying)
+        if (isPlaying) {
+            handler.post(::updateSeekBar)
+        } else {
+            handler.removeCallbacks(::updateSeekBar)
+        }
+    }
+
+    private fun updateBottomControlsVisibility(isPlaying: Boolean) {
+        bottomPlaybackControls.visibility = if (isPlaying || currentSongPosition != -1) View.VISIBLE else View.GONE
+    }
+
+    private fun updateUnplayedCount() {
+        val unplayedCount = songs.count { it.playCount == 0 }
+        unplayedSongCount.text = unplayedCount.toString()
+    }
+
+    private fun updateMostPlayedCount() {
+        // Count songs that have been played at least once
+        val playedSongsCount = songs.count { it.playCount > 0 }
+        mostPlayedCount.text = playedSongsCount.toString()
+    }
+
+    private fun updateRepeatButton() {
+        val repeatIcon = when (repeatMode) {
+            RepeatMode.NONE -> R.drawable.ic_repeat // No repeat
+            RepeatMode.ALL -> R.drawable.ic_repeat_on // Repeat all
+            RepeatMode.ONE -> R.drawable.ic_repeat_one // Repeat one
+        }
+        repeatButton.setImageResource(repeatIcon)
+        
+        // Apply or clear color filter based on mode
+        if (repeatMode == RepeatMode.NONE) {
+            repeatButton.clearColorFilter()
+        } else {
+            repeatButton.setColorFilter(ContextCompat.getColor(this, R.color.accent_color))
+        }
+    }
+
+    private fun refreshSongsFromMediaStore() {
+        // Reload songs from MediaStore
+        loadSongs()
+        // Update UI
+        songsAdapter.updateSongs(songs)
+        // Update any relevant counts
+        updateUnplayedCount()
+        updateMostPlayedCount()
+        updateFavoriteCount()
+        // Update album view if needed
+        organizeAlbums()
+        // Notify fragments
+        updateFragments()
     }
 }
