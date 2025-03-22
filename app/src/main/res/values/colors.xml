@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Primary colors -->
+    <color name="primary_color">#FF6200EE</color>
+    <color name="primary_variant">#FF3700B3</color>
+    <color name="on_primary">#FFFFFFFF</color>
+
+    <!-- Secondary colors -->
+    <color name="secondary_color">#FF03DAC5</color>
+    <color name="secondary_variant">#FF018786</color>
+    <color name="on_secondary">#FF000000</color>
+
+    <!-- Accent color -->
+    <color name="accent_color">#FF6200EE</color>
+
+    <!-- Background colors -->
+    <color name="background_color">#FF121212</color>
+    <color name="card_background">#FF1E1E1E</color>
+    <color name="surface_color">#FF1E1E1E</color>
+    <color name="on_surface">#FFFFFFFF</color>
+
+    <!-- Text colors -->
+    <color name="text_primary">#FFFFFFFF</color>
+    <color name="text_secondary">#B3FFFFFF</color>
+    <color name="text_hint">#80FFFFFF</color>
+    <color name="text_color">#FFFFFFFF</color>
+
+    <!-- Status bar and navigation -->
+    <color name="status_bar_color">#FF000000</color>
+    <color name="navigation_bar_color">#FF121212</color>
+
+    <!-- Error colors -->
+    <color name="error_color">#FFCF6679</color>
+    <color name="on_error">#FF000000</color>
+
+    <!-- Ripple and selection colors -->
+    <color name="ripple_color">#33FFFFFF</color>
+    <color name="selection_color">#33FFFFFF</color>
+
+    <!-- Divider and border colors -->
+    <color name="divider_color">#1FFFFFFF</color>
+    <color name="border_color">#1FFFFFFF</color>
+
+    <!-- White and black -->
+    <color name="white">#FFFFFFFF</color>
+    <color name="black">#FF000000</color>
+
+    <!-- Selected item background -->
+    <color name="selected_item_background">#336200EE</color>
+</resources>

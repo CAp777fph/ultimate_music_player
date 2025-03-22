@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="16dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Equalizer"
+        android:textSize="20sp"
+        android:textStyle="bold"
+        android:gravity="center"
+        android:layout_marginBottom="16dp"/>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:layout_marginBottom="16dp">
+
+        <!-- 60Hz Band -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:layout_marginBottom="8dp">
+
+            <TextView
+                android:id="@+id/text60Hz"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="60Hz"
+                android:textSize="12sp"/>
+
+            <SeekBar
+                android:id="@+id/band60Hz"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="3000"
+                android:progress="1500"/>
+        </LinearLayout>
+
+        <!-- 230Hz Band -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:layout_marginBottom="8dp">
+
+            <TextView
+                android:id="@+id/text230Hz"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="230Hz"
+                android:textSize="12sp"/>
+
+            <SeekBar
+                android:id="@+id/band230Hz"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="3000"
+                android:progress="1500"/>
+        </LinearLayout>
+
+        <!-- 910Hz Band -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:layout_marginBottom="8dp">
+
+            <TextView
+                android:id="@+id/text910Hz"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="910Hz"
+                android:textSize="12sp"/>
+
+            <SeekBar
+                android:id="@+id/band910Hz"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="3000"
+                android:progress="1500"/>
+        </LinearLayout>
+
+        <!-- 3600Hz Band -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:layout_marginBottom="8dp">
+
+            <TextView
+                android:id="@+id/text3600Hz"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="3.6kHz"
+                android:textSize="12sp"/>
+
+            <SeekBar
+                android:id="@+id/band3600Hz"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="3000"
+                android:progress="1500"/>
+        </LinearLayout>
+
+        <!-- 14000Hz Band -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:layout_marginBottom="8dp">
+
+            <TextView
+                android:id="@+id/text14000Hz"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="14kHz"
+                android:textSize="12sp"/>
+
+            <SeekBar
+                android:id="@+id/band14000Hz"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="3000"
+                android:progress="1500"/>
+        </LinearLayout>
+    </LinearLayout>
+
+    <Switch
+        android:id="@+id/enableSwitch"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Enable Equalizer"
+        android:checked="true"
+        android:layout_marginBottom="16dp"/>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="end">
+
+        <Button
+            android:id="@+id/resetButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Reset"
+            android:textColor="@color/white"
+            android:backgroundTint="#890202"
+            android:layout_marginEnd="8dp"
+            style="@style/Widget.MaterialComponents.Button.TextButton"/>
+
+        <Button
+            android:id="@+id/applyButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Apply"
+            app:cornerRadius="10dp" />
+    </LinearLayout>
+
+</LinearLayout> 
