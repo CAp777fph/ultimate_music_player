@@ -83,6 +83,8 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
     private var remainingTime: Long = 0
     private var currentPosition = 0
     private var duration = 0
+    private var isSpeedChangeInitiated = false
+    private val speedChangeHandler = Handler(Looper.getMainLooper())
     private var isTrackingTouch = false
     private val updateSeekBarHandler = Handler(Looper.getMainLooper())
     private val updateSeekBarRunnable = object : Runnable {
@@ -119,13 +121,16 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == "com.cap.ultimatemusicplayer.PLAYBACK_STATE_UPDATE") {
                 // Extract playback state from intent
-                isPlaying = intent.getBooleanExtra("is_playing", false)
+                val isPlayingUpdate = intent.getBooleanExtra("is_playing", false)
                 isShuffleEnabled = intent.getBooleanExtra("is_shuffle_enabled", false)
                 repeatMode = intent.getIntExtra("repeat_mode", 0)
-                currentSpeed = intent.getFloatExtra("playback_speed", 1.0f)
-                
-                Log.d("SongDetailsActivity", "Playback state updated: isPlaying=$isPlaying, shuffle=$isShuffleEnabled, repeat=$repeatMode, speed=$currentSpeed")
-                
+
+                // Only update speed if the song is playing
+                if (isPlayingUpdate) {
+                    currentSpeed = intent.getFloatExtra("playback_speed", 1.0f)
+                    Log.d("SongDetailsActivity", "Playback state updated (playing): isPlaying=$isPlayingUpdate, shuffle=$isShuffleEnabled, repeat=$repeatMode, speed=$currentSpeed")
+                    updateSpeedButtonColor()
+                }
                 // Update UI to reflect current state
                 updatePlaybackControls()
                 updateSpeedButtonColor()
@@ -143,6 +148,7 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
                     
                     currentTimeDetails.text = formatTime(currentPosition)
                     totalTimeDetails.text = formatTime(totalDuration)
+                    
                 }
             } else if (intent?.action == "com.cap.ultimatemusicplayer.SEEKBAR_UPDATE") {
                 // This is just a seekbar position update, don't update playback controls
@@ -536,6 +542,9 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
                     
                     // Update current speed before sending command
                 currentSpeed = selectedSpeed
+                
+                // Set flag to indicate speed change was initiated by the user
+                isSpeedChangeInitiated = true
                 
                     // Update button color immediately
                     updateSpeedButtonColor()
