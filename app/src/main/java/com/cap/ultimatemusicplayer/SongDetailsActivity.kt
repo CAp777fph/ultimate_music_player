@@ -131,6 +131,8 @@ class SongDetailsActivity : AppCompatActivity(), SeekBar.OnSeekBarChangeListener
                     Log.d("SongDetailsActivity", "Playback state updated (playing): isPlaying=$isPlayingUpdate, shuffle=$isShuffleEnabled, repeat=$repeatMode, speed=$currentSpeed")
                     updateSpeedButtonColor()
                 }
+                // Update local isPlaying state before updating UI
+                isPlaying = isPlayingUpdate
                 // Update UI to reflect current state
                 updatePlaybackControls()
                 updateSpeedButtonColor()
